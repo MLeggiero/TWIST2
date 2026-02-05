@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Add conda lib to LD_LIBRARY_PATH for IsaacGym
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
+
 # Usage: bash train.sh <experiment_id> <device>
 
 # bash train.sh 1103_twist2 cuda:0
