@@ -1,0 +1,4 @@
+pyrealsense2
+pyzmq
+numpy
+opencv-python-headless

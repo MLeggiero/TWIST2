@@ -216,65 +216,71 @@ class VisionClient:
                     # 接收消息
                     message = self.socket.recv(zmq.NOBLOCK)
                 
-                    if len(message) < 12:  # 至少需要12字节的头部
+                    # 16-byte header: [width][height][rgb_jpeg_len][depth_data_len]
+                    if len(message) < 16:
                         continue
-                    
-                    # 解析头部信息：[宽度][高度][JPEG数据长度]
+
                     width = struct.unpack('i', message[0:4])[0]
                     height = struct.unpack('i', message[4:8])[0]
-                    jpeg_length = struct.unpack('i', message[8:12])[0]
-                    
-                    # 验证JPEG数据长度
-                    actual_jpeg_size = len(message) - 12
-                    
-                    if actual_jpeg_size != jpeg_length:
+                    rgb_jpeg_len = struct.unpack('i', message[8:12])[0]
+                    depth_data_len = struct.unpack('i', message[12:16])[0]
+
+                    # Validate total payload size
+                    expected_payload = rgb_jpeg_len + depth_data_len
+                    actual_payload = len(message) - 16
+
+                    if actual_payload != expected_payload:
                         if verbose:
-                            print(f"[Warning] JPEG size mismatch: expected {jpeg_length}, got {actual_jpeg_size}")
+                            print(f"[Warning] Payload size mismatch: expected {expected_payload}, got {actual_payload}")
                         continue
-                    
-                    # 提取JPEG数据并解码
-                    jpeg_data = message[12:]
-                    
+
+                    # Extract JPEG RGB data
+                    jpeg_data = message[16 : 16 + rgb_jpeg_len]
+
+                    # Extract depth data (if present)
+                    depth_img = None
+                    if depth_data_len > 0:
+                        depth_data = message[16 + rgb_jpeg_len:]
+                        try:
+                            depth_img = np.frombuffer(depth_data, dtype=np.uint16).reshape(height, width)
+                        except ValueError:
+                            if verbose:
+                                print(f"[Warning] Could not reshape depth data ({depth_data_len}B) to {height}x{width}")
+                            depth_img = None
+
                     try:
-                        # 使用OpenCV解码JPEG数据
                         image = cv2.imdecode(np.frombuffer(jpeg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
-                        
+
                         if image is None:
                             if verbose:
                                 print("[Warning] Failed to decode JPEG image")
                             continue
-                            
-                        # 验证解码后的图像尺寸
+
                         if image.shape[0] != height or image.shape[1] != width:
                             if verbose:
                                 print(f"[Warning] Decoded image size {image.shape} doesn't match expected {height}x{width}")
-                            # 但仍继续处理，因为JPEG解码可能产生轻微的尺寸差异
-                        
+
                     except Exception as e:
                         if verbose:
                             print(f"[Warning] JPEG decode error: {e}")
                         continue
-                    
-                    # # Check what data we have
-                    # have_color_data = 'rgb' in data and data['rgb'] is not None
-                    # have_depth_data = 'depth' in data and data['depth'] is not None
-                
+
                     have_color_data = True
-                    have_depth_data = False
-                    
+                    have_depth_data = depth_data_len > 0 and depth_img is not None
+
                     if verbose:
-                        print(f"==> JPEG decoded image.shape: {image.shape}, original JPEG size: {jpeg_length} bytes")
-                    
+                        print(f"==> JPEG decoded image.shape: {image.shape}, JPEG: {rgb_jpeg_len}B, depth: {depth_data_len}B")
+
                     # Process data
                     if have_color_data:
                         self.handle_color_image(image)
-                    # if have_depth_data:
-                    #     self.handle_depth_image(image_data)
+                    if have_depth_data:
+                        self.handle_depth_image(depth_img)
                   
                     end_time = time.time()
                     loop_fps = 1.0 / (end_time - start_time)
                     
-                    print_info = f"rgb: {have_color_data} | depth: {have_depth_data} | fps: {loop_fps:.2f} | jpeg_size: {jpeg_length}B"
+                    print_info = f"rgb: {have_color_data} | depth: {have_depth_data} | fps: {loop_fps:.2f} | jpeg_size: {rgb_jpeg_len}B"
                     self._update_performance_metrics(print_info)
 
                 except zmq.Again:

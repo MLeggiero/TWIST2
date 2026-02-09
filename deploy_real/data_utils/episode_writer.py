@@ -41,7 +41,7 @@ class EpisodeWriter():
 
         self.is_available = True  # Indicates whether the class is available for new operations
         # Initialize the queue and worker thread
-        self.item_data_queue = Queue(maxsize=100)
+        self.item_data_queue = Queue(maxsize=500)
         self.stop_worker = False
         self.need_save = False  # Flag to indicate when save_episode is triggered
         self.worker_thread = Thread(target=self.process_queue)
@@ -91,6 +91,11 @@ class EpisodeWriter():
             self.rgb_dir = os.path.join(self.episode_dir, 'rgb')
             os.makedirs(self.rgb_dir, exist_ok=True)
             print(f"==> rgb_dir: {self.rgb_dir}")
+
+        if "depth" in self.data_keys:
+            self.depth_dir = os.path.join(self.episode_dir, 'depth')
+            os.makedirs(self.depth_dir, exist_ok=True)
+            print(f"==> depth_dir: {self.depth_dir}")
        
 
         self.json_path = os.path.join(self.episode_dir, 'data.json')
@@ -154,8 +159,16 @@ class EpisodeWriter():
             if not cv2.imwrite(save_path, rgb):
                 print(f"Failed to save rgb image.")
             item_data['rgb'] = str(Path(save_path).relative_to(Path(self.json_path).parent))
-            
-                
+
+        # Save depth images as 16-bit PNG
+        depth = item_data.get('depth', None)
+        if depth is not None:
+            depth_name = f'{str(idx).zfill(6)}.png'
+            save_path = os.path.join(self.depth_dir, depth_name)
+            if not cv2.imwrite(save_path, depth.astype(np.uint16)):
+                print(f"Failed to save depth image.")
+            item_data['depth'] = str(Path(save_path).relative_to(Path(self.json_path).parent))
+
         # state and action are directly saved to the episode_data
         if state_body is not None:
             item_data['state_body'] = state_body

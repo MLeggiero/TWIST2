@@ -517,25 +517,32 @@ class TeleopControlCenter:
         panels_frame.grid_rowconfigure(2, weight=1)
         panels_frame.grid_rowconfigure(3, weight=1)
         panels_frame.grid_columnconfigure(0, weight=1)
-        
+
         # G1 server panels
         self.neck_panel = TerminalPanel(panels_frame, "G1 Neck Control",
-                                       "bash ~/g1-onboard/docker_neck.sh", 
+                                       "bash ~/g1-onboard/docker_neck.sh",
                                        self.colors, is_remote=True,
                                        custom_kill_cmd="pkill -f neck_teleop.py")
         self.neck_panel.frame.grid(row=0, column=0, sticky="nsew", pady=(0, 5))
-        
+
         self.zed_panel = TerminalPanel(panels_frame, "G1 ZED Teleop",
                                       "bash ~/g1-onboard/docker_zed.sh",
                                       self.colors, is_remote=True,
                                       custom_kill_cmd="pkill -9 OrinVideoSender")
         self.zed_panel.frame.grid(row=1, column=0, sticky="nsew", pady=(5, 5))
-        
+
         # New ZED Policy panel
         self.zed_policy_panel = TerminalPanel(panels_frame, "G1 ZED Policy",
                                              "bash ~/g1-onboard/docker_zed_policy.sh",
                                              self.colors, is_remote=True)
-        self.zed_policy_panel.frame.grid(row=2, column=0, sticky="nsew", pady=(5, 0))
+        self.zed_policy_panel.frame.grid(row=2, column=0, sticky="nsew", pady=(5, 5))
+
+        # RealSense D435i streamer panel
+        self.realsense_panel = TerminalPanel(panels_frame, "G1 RealSense",
+                                            "bash ~/g1-onboard/start_realsense.sh",
+                                            self.colors, is_remote=True,
+                                            custom_kill_cmd="pkill -f realsense_streamer.py")
+        self.realsense_panel.frame.grid(row=3, column=0, sticky="nsew", pady=(5, 0))
         
         # Onboard Policy panel
         # self.onboard_policy_panel = TerminalPanel(panels_frame, "Onboard Policy",
@@ -678,16 +685,22 @@ class TeleopControlCenter:
                                              "bash /home/ANT.AMAZON.COM/yanjieze/lab42/src/Improved-3D-Diffusion-Policy/deploy_policy.sh", self.colors)
         self.visuomotor_panel.frame.grid(row=2, column=0, sticky="nsew", pady=(3, 0))
         
-        # Record server
+        # Record servers
         record_frame = ctk.CTkFrame(servers_frame, fg_color="transparent")
         record_frame.grid(row=0, column=2, sticky="nsew", padx=(7, 0))
         record_frame.grid_rowconfigure(0, weight=1)
+        record_frame.grid_rowconfigure(1, weight=1)
         record_frame.grid_columnconfigure(0, weight=1)
-        
+
         self.record_panel = TerminalPanel(record_frame, "Data Recording",
                                          "bash data_record.sh", self.colors,
                                          custom_kill_cmd="pkill -f server_data_record.py")
-        self.record_panel.frame.grid(row=0, column=0, sticky="nsew")
+        self.record_panel.frame.grid(row=0, column=0, sticky="nsew", pady=(0, 5))
+
+        self.record_d435_panel = TerminalPanel(record_frame, "Record (D435)",
+                                              "bash data_record_d435.sh", self.colors,
+                                              custom_kill_cmd="pkill -f server_data_record_d435.py")
+        self.record_d435_panel.frame.grid(row=1, column=0, sticky="nsew", pady=(5, 0))
         
         # One-click local server startup button
         local_startup_frame = ctk.CTkFrame(servers_frame, fg_color="transparent")
@@ -704,11 +717,10 @@ class TeleopControlCenter:
         # Store all panels
         self.all_panels = [
             self.neck_panel, self.zed_panel, self.zed_policy_panel,
-            
-            #  self.onboard_policy_panel, 
-            
+            self.realsense_panel,
             self.motion_panel,
-            self.teleop_panel, self.visuomotor_panel, self.record_panel, self.sim2sim_panel,
+            self.teleop_panel, self.visuomotor_panel, self.record_panel,
+            self.record_d435_panel, self.sim2sim_panel,
             self.sim2real_panel
         ]
     
