@@ -167,13 +167,16 @@ def validate_episode(episode_dir, sample_interval=10):
         if depth_path:
             full = os.path.join(episode_dir, depth_path)
             if os.path.isfile(full):
-                dimg = cv2.imread(full, cv2.IMREAD_UNCHANGED)
-                if dimg is None:
+                try:
+                    dimg = np.load(full)
+                except Exception:
                     bad_depth += 1
-                elif dimg.dtype != np.uint16:
-                    bad_depth += 1
-                elif dimg.shape[0] != height or dimg.shape[1] != width:
-                    bad_depth += 1
+                    dimg = None
+                if dimg is not None:
+                    if dimg.dtype != np.uint16:
+                        bad_depth += 1
+                    elif dimg.shape[0] != height or dimg.shape[1] != width:
+                        bad_depth += 1
 
     if bad_rgb:
         result.fail(f"{bad_rgb} sampled rgb image(s) unreadable or wrong dimensions")
@@ -241,7 +244,7 @@ def show_episodes(episode_dirs):
         depth_img = None
         if depth_path:
             full = os.path.join(ep_dir, depth_path)
-            raw = cv2.imread(full, cv2.IMREAD_UNCHANGED)
+            raw = np.load(full)
             if raw is not None:
                 # Normalize to 8-bit and apply colormap
                 normed = cv2.normalize(raw, None, 0, 255, cv2.NORM_MINMAX)

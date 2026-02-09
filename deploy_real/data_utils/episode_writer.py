@@ -160,13 +160,12 @@ class EpisodeWriter():
                 print(f"Failed to save rgb image.")
             item_data['rgb'] = str(Path(save_path).relative_to(Path(self.json_path).parent))
 
-        # Save depth images as 16-bit PNG
+        # Save depth images as raw uint16 .npy
         depth = item_data.get('depth', None)
         if depth is not None:
-            depth_name = f'{str(idx).zfill(6)}.png'
+            depth_name = f'{str(idx).zfill(6)}.npy'
             save_path = os.path.join(self.depth_dir, depth_name)
-            if not cv2.imwrite(save_path, depth.astype(np.uint16)):
-                print(f"Failed to save depth image.")
+            np.save(save_path, depth.astype(np.uint16))
             item_data['depth'] = str(Path(save_path).relative_to(Path(self.json_path).parent))
 
         # state and action are directly saved to the episode_data
@@ -228,4 +227,6 @@ class EpisodeWriter():
         while not self.is_available:
             time.sleep(0.01)
         self.stop_worker = True
-        self.worker_thread.join()
+        self.worker_thread.join(timeout=3)
+        if self.worker_thread.is_alive():
+            print("==> Warning: worker thread did not exit in time.")
