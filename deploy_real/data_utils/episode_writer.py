@@ -197,10 +197,11 @@ class EpisodeWriter():
         curent_record_time = time.time()
         print(f"==> episode_id:{self.episode_id}  item_id:{self.item_id}  current_time:{curent_record_time}")
 
-    def save_episode(self):
+    def save_episode(self, label="successful"):
         """
         Trigger the save operation. This sets the save flag, and the process_queue thread will handle it.
         """
+        self.label = label
         self.need_save = True  # Set the save flag
         print(f"==> Episode saved start...")
 
@@ -210,6 +211,7 @@ class EpisodeWriter():
         """
         self.data['info'] = self.info
         self.data['text'] = self.text
+        self.data['label'] = self.label
         self.data['data'] = self.episode_data
         with open(self.json_path, 'w', encoding='utf-8') as jsonf:
             jsonf.write(json.dumps(self.data, indent=4, ensure_ascii=False))

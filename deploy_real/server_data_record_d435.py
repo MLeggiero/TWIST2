@@ -106,6 +106,7 @@ def main(args):
 
     speaker = Speaker()
     prev_button_pressed = False
+    prev_right_axis_click_pressed = False
 
     try:
         while running:
@@ -122,6 +123,8 @@ def main(args):
                 print("\nQuitting...")
                 break
 
+            right_axis_click = controller_data["RightController"]["axis_click"]
+
             # Rising-edge toggle
             if button_pressed and not prev_button_pressed:
                 print("button pressed")
@@ -134,10 +137,17 @@ def main(args):
                     frame_counter = 0
                     print("episode recording started...")
                 else:
-                    recorder.save_episode()
-                    speaker.speak("episode saved.")
+                    recorder.save_episode(label="successful")
+                    speaker.speak("episode saved as successful.")
+
+            # Right axis_click: save as unsuccessful
+            if right_axis_click and not prev_right_axis_click_pressed and recording:
+                recorder.save_episode(label="unsuccessful")
+                recording = False
+                speaker.speak("episode saved as unsuccessful.")
 
             prev_button_pressed = button_pressed
+            prev_right_axis_click_pressed = right_axis_click
 
             if recording:
                 frame_counter += 1
