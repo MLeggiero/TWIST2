@@ -99,6 +99,13 @@ class RealTimePolicyController:
         print(f"sim_decimation: {self.sim_decimation}")
 
         self.last_action = np.zeros(self.num_actions, dtype=np.float32)
+        self.last_pd_target = np.array([
+                -0.2, 0.0, 0.0, 0.4, -0.2, 0.0,  # left leg (6)
+                -0.2, 0.0, 0.0, 0.4, -0.2, 0.0,  # right leg (6)
+                0.0, 0.0, 0.0, # torso (3)
+                0.0, 0.4, 0.0, 1.2, 0.0, 0.0, 0.0, # left arm (7)
+                0.0, -0.4, 0.0, 1.2, 0.0, 0.0, 0.0, # right arm (7)
+            ], dtype=np.float32)
 
         # G1 specific configuration
         self.default_dof_pos = np.array([
@@ -265,6 +272,7 @@ class RealTimePolicyController:
                     self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
                     self.redis_pipeline.set("state_neck_unitree_g1_with_hands", json.dumps(np.zeros(2).tolist()))
                     self.redis_pipeline.set("t_state", int(time.time() * 1000)) # current timestamp in ms
+                    self.redis_pipeline.set("action_low_level_unitree_g1_with_hands", json.dumps(self.last_pd_target.tolist()))
                     self.redis_pipeline.execute()
 
                     # Get mimic obs from Redis
@@ -338,8 +346,7 @@ class RealTimePolicyController:
                     raw_action = np.clip(raw_action, -10., 10.)
                     scaled_actions = raw_action * self.action_scale
                     pd_target = scaled_actions + self.default_dof_pos
-
-                    # self.redis_client.set("action_low_level_unitree_g1", json.dumps(raw_action.tolist()))
+                    self.last_pd_target = pd_target.copy()
                     
                     # Update camera to follow pelvis
                     pelvis_pos = self.data.xpos[self.model.body("pelvis").id]

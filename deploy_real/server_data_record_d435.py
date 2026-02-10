@@ -174,6 +174,7 @@ def main(args):
                     "action_hand_right_unitree_g1_with_hands",
                     "action_neck_unitree_g1_with_hands",
                     "t_action",
+                    "action_low_level_unitree_g1_with_hands",
                 ]
 
                 data_dict_keys = [
@@ -187,6 +188,7 @@ def main(args):
                     "action_hand_right",
                     "action_neck",
                     "t_action",
+                    "action_low_level",
                 ]
 
                 try:

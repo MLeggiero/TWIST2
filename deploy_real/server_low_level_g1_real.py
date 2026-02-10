@@ -148,6 +148,7 @@ class RealTimePolicyController(object):
             self.proprio_history_buf.append(np.zeros(self.n_obs_single, dtype=np.float32))
 
         self.last_action = np.zeros(self.num_actions, dtype=np.float32)
+        self.last_target_dof_pos = self.default_dof_pos.copy()
 
         self.control_dt = self.config.control_dt
         self.action_scale = self.config.action_scale
@@ -225,6 +226,7 @@ class RealTimePolicyController(object):
                     self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", hand_left_json)
                     self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", hand_right_json)
                 
+                self.redis_pipeline.set("action_low_level_unitree_g1_with_hands", json.dumps(self.last_target_dof_pos.tolist()))
                 # execute the pipeline once here for setting the keys
                 self.redis_pipeline.execute()
 
@@ -270,8 +272,7 @@ class RealTimePolicyController(object):
 
                 raw_action = np.clip(raw_action, -10.0, 10.0)
                 target_dof_pos = self.default_dof_pos + raw_action * self.action_scale
-
-                # self.redis_client.set("action_low_level_unitree_g1", json.dumps(raw_action.tolist()))
+                self.last_target_dof_pos = target_dof_pos.copy()
 
                 kp_scale = 1.0
                 kd_scale = 1.0
