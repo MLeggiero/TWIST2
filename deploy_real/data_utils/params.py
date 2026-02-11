@@ -128,7 +128,24 @@ DEFAULT_HAND_POSE = {
                 ])
         },
     },
-    "booster_t1": 
+    "unitree_g1_inspire":
+    {
+        # Inspire RH56DFTP: 6 DOF per hand (pinky, ring, middle, index, thumb_bend, thumb_rotation)
+        # Values in range [0, 1000]: 0 = open, 1000 = closed
+        "left": {
+            "open": np.array([0, 0, 0, 0, 0, 0], dtype=np.float32),
+            "close": np.array([1000, 1000, 1000, 1000, 1000, 1000], dtype=np.float32),
+            "open_pinch": np.array([0, 0, 0, 0, 0, 0], dtype=np.float32),
+            "close_pinch": np.array([0, 0, 0, 1000, 1000, 1000], dtype=np.float32),
+        },
+        "right": {
+            "open": np.array([0, 0, 0, 0, 0, 0], dtype=np.float32),
+            "close": np.array([1000, 1000, 1000, 1000, 1000, 1000], dtype=np.float32),
+            "open_pinch": np.array([0, 0, 0, 0, 0, 0], dtype=np.float32),
+            "close_pinch": np.array([0, 0, 0, 1000, 1000, 1000], dtype=np.float32),
+        },
+    },
+    "booster_t1":
     {
         "left": {
             "open": np.array([0, 0]), # parallel gripper
