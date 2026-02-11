@@ -1,3 +1,7 @@
+#!/bin/bash
+
+# Add conda lib to LD_LIBRARY_PATH for IsaacGym
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
 
 # bash eval.sh 1002_twist2 cuda:1
 

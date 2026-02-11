@@ -7,6 +7,9 @@
 1.4 `bash docker_zed.sh` for starting orin zed sender
 1.5 Start to listen to ZED MINI camera in VR (you should now see the camera feed in the VR)
 
+1.3a (RealSense alternative) Verify D435i: `ssh g1` then `rs-enumerate-devices`
+1.4a (RealSense alternative) `bash ~/g1-onboard/start_realsense.sh` on the Orin (see doc/REALSENSE_CAMERA.md)
+
 
 2.1 Wear motion trackers; wear controllers on the wrists
 2.2 Start the VR

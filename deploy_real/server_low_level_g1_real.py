@@ -15,6 +15,7 @@ import os
 from data_utils.rot_utils import quatToEuler
 
 from robot_control.dex_hand_wrapper import Dex3_1_Controller
+from robot_control.inspire_hand_wrapper import InspireHandController
 
 try:
     import onnxruntime as ort
@@ -94,12 +95,15 @@ class RealTimePolicyController(object):
     Real robot controller for TWIST2 policy.
     Based on server_low_level_g1_real.py but adapted for TWIST2 architecture.
     """
-    def __init__(self, 
+    def __init__(self,
                  policy_path,
                  config_path,
                  device='cuda',
                  net='eno1',
                  use_hand=False,
+                 hand_type='dex3',
+                 inspire_left_ip='192.168.123.210',
+                 inspire_right_ip='192.168.123.211',
                  record_proprio=False,
                  smooth_body=0.0):
         self.redis_client = None
@@ -109,12 +113,20 @@ class RealTimePolicyController(object):
         except Exception as e:
             print(f"Error connecting to Redis: {e}")
             exit()
-       
+
         self.config = Config(config_path)
         self.env = G1RealWorldEnv(net=net, config=self.config)
         self.use_hand = use_hand
+        self.hand_type = hand_type
+        self.hand_dof = 6 if hand_type == 'inspire' else 7
         if use_hand:
-            self.hand_ctrl = Dex3_1_Controller(net, re_init=False)
+            if hand_type == 'inspire':
+                self.hand_ctrl = InspireHandController(
+                    left_ip=inspire_left_ip,
+                    right_ip=inspire_right_ip,
+                    re_init=False)
+            else:
+                self.hand_ctrl = Dex3_1_Controller(net, re_init=False)
 
         self.device = device
         self.policy = load_onnx_policy(policy_path, device)
@@ -148,6 +160,7 @@ class RealTimePolicyController(object):
             self.proprio_history_buf.append(np.zeros(self.n_obs_single, dtype=np.float32))
 
         self.last_action = np.zeros(self.num_actions, dtype=np.float32)
+        self.last_target_dof_pos = self.default_dof_pos.copy()
 
         self.control_dt = self.config.control_dt
         self.action_scale = self.config.action_scale
@@ -225,6 +238,7 @@ class RealTimePolicyController(object):
                     self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", hand_left_json)
                     self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", hand_right_json)
                 
+                self.redis_pipeline.set("action_low_level_unitree_g1_with_hands", json.dumps(self.last_target_dof_pos.tolist()))
                 # execute the pipeline once here for setting the keys
                 self.redis_pipeline.execute()
 
@@ -248,8 +262,8 @@ class RealTimePolicyController(object):
                     action_hand_left = np.array(action_hand_left, dtype=np.float32)
                     action_hand_right = np.array(action_hand_right, dtype=np.float32)
                 else:
-                    action_hand_left = np.zeros(7, dtype=np.float32)
-                    action_hand_right = np.zeros(7, dtype=np.float32)
+                    action_hand_left = np.zeros(self.hand_dof, dtype=np.float32)
+                    action_hand_right = np.zeros(self.hand_dof, dtype=np.float32)
 
                 obs_full = np.concatenate([action_mimic, obs_proprio])
                 
@@ -270,8 +284,7 @@ class RealTimePolicyController(object):
 
                 raw_action = np.clip(raw_action, -10.0, 10.0)
                 target_dof_pos = self.default_dof_pos + raw_action * self.action_scale
-
-                # self.redis_client.set("action_low_level_unitree_g1", json.dumps(raw_action.tolist()))
+                self.last_target_dof_pos = target_dof_pos.copy()
 
                 kp_scale = 1.0
                 kd_scale = 1.0
@@ -334,6 +347,13 @@ def main():
                         help='Network interface for robot communication')
     parser.add_argument('--use_hand', action='store_true',
                         help='Enable hand control')
+    parser.add_argument('--hand_type', type=str, default='dex3',
+                        choices=['dex3', 'inspire'],
+                        help='Type of dextrous hand (dex3 or inspire)')
+    parser.add_argument('--inspire_left_ip', type=str, default='192.168.123.210',
+                        help='IP address of left Inspire hand')
+    parser.add_argument('--inspire_right_ip', type=str, default='192.168.123.211',
+                        help='IP address of right Inspire hand')
     parser.add_argument('--record_proprio', action='store_true',
                         help='Record proprioceptive data')
     parser.add_argument('--smooth_body', type=float, default=0.0,
@@ -357,6 +377,10 @@ def main():
     print(f"  Device: {args.device}")
     print(f"  Network interface: {args.net}")
     print(f"  Use hand: {args.use_hand}")
+    print(f"  Hand type: {args.hand_type}")
+    if args.hand_type == 'inspire':
+        print(f"  Inspire left IP: {args.inspire_left_ip}")
+        print(f"  Inspire right IP: {args.inspire_right_ip}")
     print(f"  Record proprio: {args.record_proprio}")
     print(f"  Smooth body: {args.smooth_body}")
     
@@ -375,6 +399,9 @@ def main():
         device=args.device,
         net=args.net,
         use_hand=args.use_hand,
+        hand_type=args.hand_type,
+        inspire_left_ip=args.inspire_left_ip,
+        inspire_right_ip=args.inspire_right_ip,
         record_proprio=args.record_proprio,
         smooth_body=args.smooth_body,
     )

@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Add conda lib to LD_LIBRARY_PATH for IsaacGym
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
+
 # Script to convert student policy with future motion support to ONNX
 
 # bash to_onnx.sh $YOUR_POLICY_PATH

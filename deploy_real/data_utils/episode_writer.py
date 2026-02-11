@@ -41,7 +41,7 @@ class EpisodeWriter():
 
         self.is_available = True  # Indicates whether the class is available for new operations
         # Initialize the queue and worker thread
-        self.item_data_queue = Queue(maxsize=100)
+        self.item_data_queue = Queue(maxsize=500)
         self.stop_worker = False
         self.need_save = False  # Flag to indicate when save_episode is triggered
         self.worker_thread = Thread(target=self.process_queue)
@@ -91,6 +91,11 @@ class EpisodeWriter():
             self.rgb_dir = os.path.join(self.episode_dir, 'rgb')
             os.makedirs(self.rgb_dir, exist_ok=True)
             print(f"==> rgb_dir: {self.rgb_dir}")
+
+        if "depth" in self.data_keys:
+            self.depth_dir = os.path.join(self.episode_dir, 'depth')
+            os.makedirs(self.depth_dir, exist_ok=True)
+            print(f"==> depth_dir: {self.depth_dir}")
        
 
         self.json_path = os.path.join(self.episode_dir, 'data.json')
@@ -154,8 +159,15 @@ class EpisodeWriter():
             if not cv2.imwrite(save_path, rgb):
                 print(f"Failed to save rgb image.")
             item_data['rgb'] = str(Path(save_path).relative_to(Path(self.json_path).parent))
-            
-                
+
+        # Save depth images as raw uint16 .npy
+        depth = item_data.get('depth', None)
+        if depth is not None:
+            depth_name = f'{str(idx).zfill(6)}.npy'
+            save_path = os.path.join(self.depth_dir, depth_name)
+            np.save(save_path, depth.astype(np.uint16))
+            item_data['depth'] = str(Path(save_path).relative_to(Path(self.json_path).parent))
+
         # state and action are directly saved to the episode_data
         if state_body is not None:
             item_data['state_body'] = state_body
@@ -185,10 +197,11 @@ class EpisodeWriter():
         curent_record_time = time.time()
         print(f"==> episode_id:{self.episode_id}  item_id:{self.item_id}  current_time:{curent_record_time}")
 
-    def save_episode(self):
+    def save_episode(self, label="successful"):
         """
         Trigger the save operation. This sets the save flag, and the process_queue thread will handle it.
         """
+        self.label = label
         self.need_save = True  # Set the save flag
         print(f"==> Episode saved start...")
 
@@ -198,6 +211,7 @@ class EpisodeWriter():
         """
         self.data['info'] = self.info
         self.data['text'] = self.text
+        self.data['label'] = self.label
         self.data['data'] = self.episode_data
         with open(self.json_path, 'w', encoding='utf-8') as jsonf:
             jsonf.write(json.dumps(self.data, indent=4, ensure_ascii=False))
@@ -215,4 +229,6 @@ class EpisodeWriter():
         while not self.is_available:
             time.sleep(0.01)
         self.stop_worker = True
-        self.worker_thread.join()
+        self.worker_thread.join(timeout=3)
+        if self.worker_thread.is_alive():
+            print("==> Warning: worker thread did not exit in time.")

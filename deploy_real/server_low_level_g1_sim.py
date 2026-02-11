@@ -56,18 +56,21 @@ def load_onnx_policy(policy_path: str, device: str) -> OnnxPolicyWrapper:
 
 
 class RealTimePolicyController:
-    def __init__(self, 
-                 xml_file, 
-                 policy_path, 
-                 device='cuda', 
+    def __init__(self,
+                 xml_file,
+                 policy_path,
+                 device='cuda',
                  record_video=False,
                  record_proprio=False,
                  measure_fps=False,
                  limit_fps=True,
                  policy_frequency=50,
+                 hand_type='dex3',
                  ):
         self.measure_fps = measure_fps
         self.limit_fps = limit_fps
+        self.hand_type = hand_type
+        self.hand_dof = 6 if hand_type == 'inspire' else 7
         self.redis_client = None
         try:
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -99,6 +102,13 @@ class RealTimePolicyController:
         print(f"sim_decimation: {self.sim_decimation}")
 
         self.last_action = np.zeros(self.num_actions, dtype=np.float32)
+        self.last_pd_target = np.array([
+                -0.2, 0.0, 0.0, 0.4, -0.2, 0.0,  # left leg (6)
+                -0.2, 0.0, 0.0, 0.4, -0.2, 0.0,  # right leg (6)
+                0.0, 0.0, 0.0, # torso (3)
+                0.0, 0.4, 0.0, 1.2, 0.0, 0.0, 0.0, # left arm (7)
+                0.0, -0.4, 0.0, 1.2, 0.0, 0.0, 0.0, # right arm (7)
+            ], dtype=np.float32)
 
         # G1 specific configuration
         self.default_dof_pos = np.array([
@@ -220,8 +230,8 @@ class RealTimePolicyController:
         # Send initial proprio to redis
         initial_obs = np.zeros(self.n_obs_single, dtype=np.float32)
         self.redis_pipeline.set("state_body_unitree_g1_with_hands", json.dumps(initial_obs.tolist()))
-        self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
-        self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
+        self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(self.hand_dof).tolist()))
+        self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(self.hand_dof).tolist()))
         self.redis_pipeline.execute()
 
         measure_fps = self.measure_fps
@@ -261,10 +271,11 @@ class RealTimePolicyController:
                     # Send proprio to redis
                     
                     self.redis_pipeline.set("state_body_unitree_g1_with_hands", json.dumps(state_body.tolist()))
-                    self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
-                    self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(7).tolist()))
+                    self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", json.dumps(np.zeros(self.hand_dof).tolist()))
+                    self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", json.dumps(np.zeros(self.hand_dof).tolist()))
                     self.redis_pipeline.set("state_neck_unitree_g1_with_hands", json.dumps(np.zeros(2).tolist()))
                     self.redis_pipeline.set("t_state", int(time.time() * 1000)) # current timestamp in ms
+                    self.redis_pipeline.set("action_low_level_unitree_g1_with_hands", json.dumps(self.last_pd_target.tolist()))
                     self.redis_pipeline.execute()
 
                     # Get mimic obs from Redis
@@ -338,8 +349,7 @@ class RealTimePolicyController:
                     raw_action = np.clip(raw_action, -10., 10.)
                     scaled_actions = raw_action * self.action_scale
                     pd_target = scaled_actions + self.default_dof_pos
-
-                    # self.redis_client.set("action_low_level_unitree_g1", json.dumps(raw_action.tolist()))
+                    self.last_pd_target = pd_target.copy()
                     
                     # Update camera to follow pelvis
                     pelvis_pos = self.data.xpos[self.model.body("pelvis").id]
@@ -414,6 +424,9 @@ def main():
     parser.add_argument("--measure_fps", help="Measure FPS", default=0, type=int)
     parser.add_argument("--limit_fps", help="Limit FPS with sleep", default=1, type=int)
     parser.add_argument("--policy_frequency", help="Policy frequency", default=100, type=int)
+    parser.add_argument("--hand_type", type=str, default="dex3",
+                        choices=["dex3", "inspire"],
+                        help="Type of dextrous hand (dex3 or inspire)")
     args = parser.parse_args()
     
     # Verify policy file exists
@@ -443,6 +456,7 @@ def main():
         measure_fps=args.measure_fps,
         limit_fps=args.limit_fps,
         policy_frequency=args.policy_frequency,
+        hand_type=args.hand_type,
     )
     controller.run()
 
