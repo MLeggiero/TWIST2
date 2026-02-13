@@ -85,8 +85,8 @@ class InspireHandController:
 
         # Clear errors on init
         if re_init:
-            self.left_client.write_register(REG_CLEAR_ERROR, 1, self.device_id)
-            self.right_client.write_register(REG_CLEAR_ERROR, 1, self.device_id)
+            self.left_client.write_register(REG_CLEAR_ERROR, 1, slave=self.device_id)
+            self.right_client.write_register(REG_CLEAR_ERROR, 1, slave=self.device_id)
 
         # State arrays
         self.left_hand_state_array = np.zeros(Inspire_Num_Motors, dtype=np.float32)
@@ -111,7 +111,7 @@ class InspireHandController:
     def _read_registers_signed(self, client, address, count):
         """Read Modbus registers and interpret as signed int16."""
         try:
-            response = client.read_holding_registers(address, count, self.device_id)
+            response = client.read_holding_registers(address, count, slave=self.device_id)
             if not response.isError():
                 packed = struct.pack('>' + 'H' * count, *response.registers)
                 return list(struct.unpack('>' + 'h' * count, packed))
@@ -125,7 +125,7 @@ class InspireHandController:
     def _read_registers_bytes(self, client, address, count):
         """Read Modbus registers and unpack as individual bytes (2 bytes per register)."""
         try:
-            response = client.read_holding_registers(address, count, self.device_id)
+            response = client.read_holding_registers(address, count, slave=self.device_id)
             if not response.isError():
                 byte_list = []
                 for reg in response.registers:
@@ -189,8 +189,8 @@ class InspireHandController:
         right_angles = [int(np.clip(v, 0, 1000)) for v in right_q_target]
 
         try:
-            self.left_client.write_registers(REG_ANGLE_SET, left_angles, self.device_id)
-            self.right_client.write_registers(REG_ANGLE_SET, right_angles, self.device_id)
+            self.left_client.write_registers(REG_ANGLE_SET, left_angles, slave=self.device_id)
+            self.right_client.write_registers(REG_ANGLE_SET, right_angles, slave=self.device_id)
         except Exception as e:
             print(f"Error writing hand commands: {e}")
 
