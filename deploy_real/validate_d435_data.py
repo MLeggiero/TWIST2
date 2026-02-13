@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate D435i recorded episode data for completeness and integrity."""
+"""Validate D435i and MID-360 recorded episode data for completeness and integrity."""
 
 import argparse
 import json
@@ -22,6 +22,7 @@ class EpisodeResult:
         self.duration_s = 0.0
         self.rgb_count = 0
         self.depth_count = 0
+        self.pointcloud_count = 0
         self.warnings = []
         self.errors = []
 
@@ -36,7 +37,8 @@ class EpisodeResult:
 
     def summary_line(self):
         base = f"{self.name}: {self.status}"
-        detail = f"({self.n_frames} frames, {self.duration_s:.1f}s, rgb={self.rgb_count}, depth={self.depth_count})"
+        pc_str = f", pc={self.pointcloud_count}" if self.pointcloud_count > 0 else ""
+        detail = f"({self.n_frames} frames, {self.duration_s:.1f}s, rgb={self.rgb_count}, depth={self.depth_count}{pc_str})"
         issues = self.errors + self.warnings
         if issues:
             return f"{base}  {detail} — {'; '.join(issues)}"
@@ -56,10 +58,13 @@ def validate_episode(episode_dir, sample_interval=10):
     if not os.path.isfile(data_json_path):
         result.fail("data.json missing")
         return result
-    if not os.path.isdir(rgb_dir):
-        result.fail("rgb/ directory missing")
-        return result
+    has_rgb_dir = os.path.isdir(rgb_dir)
     has_depth_dir = os.path.isdir(depth_dir)
+    pointcloud_dir = os.path.join(episode_dir, "pointcloud")
+    has_pointcloud_dir = os.path.isdir(pointcloud_dir)
+    if not has_rgb_dir and not has_pointcloud_dir:
+        result.fail("neither rgb/ nor pointcloud/ directory found")
+        return result
 
     # 2. JSON parse
     try:
@@ -98,10 +103,10 @@ def validate_episode(episode_dir, sample_interval=10):
 
     # 4. Frame count consistency
     result.n_frames = len(frames)
-    rgb_files = os.listdir(rgb_dir)
+    rgb_files = os.listdir(rgb_dir) if has_rgb_dir else []
     result.rgb_count = len(rgb_files)
 
-    if result.n_frames != result.rgb_count:
+    if has_rgb_dir and result.n_frames != result.rgb_count:
         result.fail(f"rgb count mismatch (json={result.n_frames}, files={result.rgb_count})")
 
     if has_depth_dir:
@@ -111,6 +116,14 @@ def validate_episode(episode_dir, sample_interval=10):
             result.fail(f"depth count mismatch (json={result.n_frames}, files={result.depth_count})")
     else:
         result.depth_count = 0
+
+    if has_pointcloud_dir:
+        pc_files = os.listdir(pointcloud_dir)
+        result.pointcloud_count = len(pc_files)
+        if result.n_frames != result.pointcloud_count:
+            result.fail(f"pointcloud count mismatch (json={result.n_frames}, files={result.pointcloud_count})")
+    else:
+        result.pointcloud_count = 0
 
     if result.n_frames == 0:
         result.warn("episode has 0 frames")
@@ -131,6 +144,7 @@ def validate_episode(episode_dir, sample_interval=10):
     # 6. File existence
     missing_rgb = 0
     missing_depth = 0
+    missing_pc = 0
     for frame in frames:
         rgb_path = frame.get("rgb")
         if rgb_path:
@@ -142,11 +156,18 @@ def validate_episode(episode_dir, sample_interval=10):
             full = os.path.join(episode_dir, depth_path)
             if not os.path.isfile(full):
                 missing_depth += 1
+        pc_path = frame.get("pointcloud")
+        if pc_path:
+            full = os.path.join(episode_dir, pc_path)
+            if not os.path.isfile(full):
+                missing_pc += 1
 
     if missing_rgb:
         result.fail(f"{missing_rgb} rgb file(s) referenced in JSON but missing on disk")
     if missing_depth:
         result.fail(f"{missing_depth} depth file(s) referenced in JSON but missing on disk")
+    if missing_pc:
+        result.fail(f"{missing_pc} pointcloud file(s) referenced in JSON but missing on disk")
 
     # 7. Image readability & dimensions (sample every Nth frame)
     bad_rgb = 0
@@ -178,10 +199,31 @@ def validate_episode(episode_dir, sample_interval=10):
                     elif dimg.shape[0] != height or dimg.shape[1] != width:
                         bad_depth += 1
 
+    # 7b. Point cloud readability (sample every Nth frame)
+    bad_pc = 0
+    for i in range(0, len(frames), sample_interval):
+        frame = frames[i]
+        pc_path = frame.get("pointcloud")
+        if pc_path:
+            full = os.path.join(episode_dir, pc_path)
+            if os.path.isfile(full):
+                try:
+                    pcdata = np.load(full)
+                except Exception:
+                    bad_pc += 1
+                    pcdata = None
+                if pcdata is not None:
+                    if pcdata.dtype != np.float32:
+                        bad_pc += 1
+                    elif pcdata.ndim != 2 or pcdata.shape[1] != 4:
+                        bad_pc += 1
+
     if bad_rgb:
         result.fail(f"{bad_rgb} sampled rgb image(s) unreadable or wrong dimensions")
     if bad_depth:
         result.fail(f"{bad_depth} sampled depth image(s) unreadable, wrong dtype, or wrong dimensions")
+    if bad_pc:
+        result.fail(f"{bad_pc} sampled pointcloud(s) unreadable, wrong dtype, or wrong shape")
 
     # 8. State/action completeness
     missing_state = 0
@@ -199,17 +241,18 @@ def validate_episode(episode_dir, sample_interval=10):
     if missing_action:
         result.warn(f"{missing_action} frames missing action_body")
 
-    # 9. Timestamp monotonicity
-    t_imgs = [f.get("t_img") for f in frames]
-    if all(t is not None for t in t_imgs):
-        for i in range(1, len(t_imgs)):
-            if t_imgs[i] <= t_imgs[i - 1]:
-                result.warn("t_img not strictly increasing")
+    # 9. Timestamp monotonicity (supports t_img for D435 and t_lidar for MID360)
+    t_key = "t_img" if has_rgb_dir else "t_lidar"
+    t_vals = [f.get(t_key) for f in frames]
+    if all(t is not None for t in t_vals):
+        for i in range(1, len(t_vals)):
+            if t_vals[i] <= t_vals[i - 1]:
+                result.warn(f"{t_key} not strictly increasing")
                 break
         # Compute duration
-        result.duration_s = (t_imgs[-1] - t_imgs[0]) / 1000.0 if len(t_imgs) > 1 else 0.0
+        result.duration_s = (t_vals[-1] - t_vals[0]) / 1000.0 if len(t_vals) > 1 else 0.0
     else:
-        result.warn("some frames missing t_img")
+        result.warn(f"some frames missing {t_key}")
         result.duration_s = 0.0
 
     return result
