@@ -516,6 +516,7 @@ class TeleopControlCenter:
         panels_frame.grid_rowconfigure(1, weight=1)
         panels_frame.grid_rowconfigure(2, weight=1)
         panels_frame.grid_rowconfigure(3, weight=1)
+        panels_frame.grid_rowconfigure(4, weight=1)
         panels_frame.grid_columnconfigure(0, weight=1)
 
         # G1 server panels
@@ -542,17 +543,18 @@ class TeleopControlCenter:
                                             "bash ~/g1-onboard/start_realsense.sh",
                                             self.colors, is_remote=True,
                                             custom_kill_cmd="pkill -f realsense_streamer.py")
-        self.realsense_panel.frame.grid(row=3, column=0, sticky="nsew", pady=(5, 0))
-        
-        # Onboard Policy panel
-        # self.onboard_policy_panel = TerminalPanel(panels_frame, "Onboard Policy",
-        #                                          "bash ~/g1-onboard/sim2real.sh",
-        #                                          self.colors, is_remote=True)
-        # self.onboard_policy_panel.frame.grid(row=3, column=0, sticky="nsew", pady=(5, 0))
-        
+        self.realsense_panel.frame.grid(row=3, column=0, sticky="nsew", pady=(5, 5))
+
+        # Livox MID-360 LiDAR streamer panel
+        self.mid360_panel = TerminalPanel(panels_frame, "G1 MID360",
+                                          "bash ~/g1-onboard/start_mid360.sh",
+                                          self.colors, is_remote=True,
+                                          custom_kill_cmd="pkill -f mid360_streamer.py")
+        self.mid360_panel.frame.grid(row=4, column=0, sticky="nsew", pady=(5, 0))
+
         # All control buttons in one row
         buttons_frame = ctk.CTkFrame(panels_frame, fg_color="transparent")
-        buttons_frame.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        buttons_frame.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         
         kill_port_btn = ctk.CTkButton(buttons_frame, text="Kill Port",
                                      command=self._execute_kill_port,
@@ -690,6 +692,7 @@ class TeleopControlCenter:
         record_frame.grid(row=0, column=2, sticky="nsew", padx=(7, 0))
         record_frame.grid_rowconfigure(0, weight=1)
         record_frame.grid_rowconfigure(1, weight=1)
+        record_frame.grid_rowconfigure(2, weight=1)
         record_frame.grid_columnconfigure(0, weight=1)
 
         self.record_panel = TerminalPanel(record_frame, "Data Recording",
@@ -700,7 +703,12 @@ class TeleopControlCenter:
         self.record_d435_panel = TerminalPanel(record_frame, "Record (D435)",
                                               "bash data_record_d435.sh", self.colors,
                                               custom_kill_cmd="pkill -f server_data_record_d435.py")
-        self.record_d435_panel.frame.grid(row=1, column=0, sticky="nsew", pady=(5, 0))
+        self.record_d435_panel.frame.grid(row=1, column=0, sticky="nsew", pady=(5, 5))
+
+        self.record_mid360_panel = TerminalPanel(record_frame, "Record (MID360)",
+                                                "bash data_record_mid360.sh", self.colors,
+                                                custom_kill_cmd="pkill -f server_data_record_mid360.py")
+        self.record_mid360_panel.frame.grid(row=2, column=0, sticky="nsew", pady=(5, 0))
         
         # One-click local server startup button
         local_startup_frame = ctk.CTkFrame(servers_frame, fg_color="transparent")
@@ -717,11 +725,11 @@ class TeleopControlCenter:
         # Store all panels
         self.all_panels = [
             self.neck_panel, self.zed_panel, self.zed_policy_panel,
-            self.realsense_panel,
+            self.realsense_panel, self.mid360_panel,
             self.motion_panel,
             self.teleop_panel, self.visuomotor_panel, self.record_panel,
-            self.record_d435_panel, self.sim2sim_panel,
-            self.sim2real_panel
+            self.record_d435_panel, self.record_mid360_panel,
+            self.sim2sim_panel, self.sim2real_panel
         ]
     
     def _change_theme(self, theme_name):

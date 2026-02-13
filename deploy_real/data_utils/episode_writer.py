@@ -96,7 +96,11 @@ class EpisodeWriter():
             self.depth_dir = os.path.join(self.episode_dir, 'depth')
             os.makedirs(self.depth_dir, exist_ok=True)
             print(f"==> depth_dir: {self.depth_dir}")
-       
+
+        if "pointcloud" in self.data_keys:
+            self.pointcloud_dir = os.path.join(self.episode_dir, 'pointcloud')
+            os.makedirs(self.pointcloud_dir, exist_ok=True)
+            print(f"==> pointcloud_dir: {self.pointcloud_dir}")
 
         self.json_path = os.path.join(self.episode_dir, 'data.json')
 
@@ -167,6 +171,14 @@ class EpisodeWriter():
             save_path = os.path.join(self.depth_dir, depth_name)
             np.save(save_path, depth.astype(np.uint16))
             item_data['depth'] = str(Path(save_path).relative_to(Path(self.json_path).parent))
+
+        # Save point cloud as float32 .npy (N, 4): x, y, z, intensity
+        pointcloud = item_data.get('pointcloud', None)
+        if pointcloud is not None:
+            pc_name = f'{str(idx).zfill(6)}.npy'
+            save_path = os.path.join(self.pointcloud_dir, pc_name)
+            np.save(save_path, pointcloud.astype(np.float32))
+            item_data['pointcloud'] = str(Path(save_path).relative_to(Path(self.json_path).parent))
 
         # state and action are directly saved to the episode_data
         if state_body is not None:

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Deploy RealSense streamer files to the G1 Orin.
+# Deploy RealSense + MID-360 streamer files to the G1 Orin.
 # Usage: bash deploy_real/onboard/deploy_to_robot.sh
 
 set -e
@@ -14,6 +14,8 @@ echo "==> Creating remote directory and copying files to ${ROBOT_USER}@${ROBOT_I
 ssh "${ROBOT_USER}@${ROBOT_IP}" "mkdir -p ${REMOTE_DIR}"
 scp "${SCRIPT_DIR}/realsense_streamer.py" \
     "${SCRIPT_DIR}/start_realsense.sh" \
+    "${SCRIPT_DIR}/mid360_streamer.py" \
+    "${SCRIPT_DIR}/start_mid360.sh" \
     "${SCRIPT_DIR}/requirements.txt" \
     "${ROBOT_USER}@${ROBOT_IP}:${REMOTE_DIR}/"
 
