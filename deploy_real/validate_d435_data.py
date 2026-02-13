@@ -59,12 +59,12 @@ def validate_episode(episode_dir, sample_interval=10):
         result.fail("data.json missing")
         return result
     has_rgb_dir = os.path.isdir(rgb_dir)
-    if not has_rgb_dir and not os.path.isdir(pointcloud_dir):
-        result.fail("neither rgb/ nor pointcloud/ directory found")
-        return result
     has_depth_dir = os.path.isdir(depth_dir)
     pointcloud_dir = os.path.join(episode_dir, "pointcloud")
     has_pointcloud_dir = os.path.isdir(pointcloud_dir)
+    if not has_rgb_dir and not has_pointcloud_dir:
+        result.fail("neither rgb/ nor pointcloud/ directory found")
+        return result
 
     # 2. JSON parse
     try:
