@@ -366,7 +366,15 @@ class XRobotTeleopToRobot:
         self.robot_name = args.robot
         self.xml_file = ROBOT_XML_DICT[args.robot]
         self.robot_base = ROBOT_BASE_DICT[args.robot]
-        
+        self.hand_type = getattr(args, 'hand_type', 'dex3')
+        # Select hand pose configuration based on hand type
+        if self.hand_type == 'inspire':
+            self.hand_pose_key = "unitree_g1_inspire"
+        else:
+            self.hand_pose_key = args.robot
+
+        print(f"Hand type: {self.hand_type}")
+        print(f"Hand pose config: {self.hand_pose_key}")
         print(f"Pinch mode: {self.args.pinch_mode}")
         # Initialize state tracking
         self.last_qpos = None
@@ -629,7 +637,7 @@ class XRobotTeleopToRobot:
         
         # Send hand action to redis
         if self.redis_client is not None:
-            hand_left_pose, hand_right_pose = self.state_machine.get_hand_pose(self.robot_name)
+            hand_left_pose, hand_right_pose = self.state_machine.get_hand_pose(self.hand_pose_key)
             self.redis_pipeline.set("action_hand_left_unitree_g1_with_hands", json.dumps(hand_left_pose.tolist()))
             self.redis_pipeline.set("action_hand_right_unitree_g1_with_hands", json.dumps(hand_right_pose.tolist()))
         
@@ -785,6 +793,13 @@ def parse_arguments():
         "--record_video",
         action="store_true",
         help="Whether to record the video.",
+    )
+    parser.add_argument(
+        "--hand_type",
+        type=str,
+        default="dex3",
+        choices=["dex3", "inspire"],
+        help="Type of dextrous hand (dex3 or inspire).",
     )
     parser.add_argument(
         "--pinch_mode",
