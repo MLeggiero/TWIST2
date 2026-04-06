@@ -322,7 +322,41 @@ bash data_record_d435.sh
    - **Left controller axis click** — quit recording
 
 ### Data Format
-Episodes are saved to `deploy_real/twist2_demonstration/<task_name>/`, each containing `data.json` with per-frame state/action vectors, `rgb/` JPEG images, and `depth/` uint16 PNG depth maps.
+Episodes are saved to `deploy_real/twist2_demonstration/<task_name>/`, each containing `data.json` with per-frame state/action vectors, `rgb/` JPEG images, and `depth/` uint16 PNG depth maps. When recording with **Inspire RH56DFTP** hands, each frame also includes `tactile_hand_left` and `tactile_hand_right` — flat 1062-element lists of uint16 touch values from the dense fingertip / finger nail / finger pad / thumb / palm tactile arrays. See [Inspire Hand Control → Tactile Sensing](#inspire-hand-control) below for the per-region layout.
+
+#### Labelled state / action layout (GR00T / LeRobot compatible)
+
+Recorded episodes use a **joint-first** labelled layout so the dataset is directly comparable to NVIDIA Isaac-GR00T datasets. Each task directory now contains a `meta/modality.json` file (LeRobot convention), and every `data.json` embeds an inline `schema` block describing the same layout in human-readable form.
+
+`state_body` is a 34-dim flat vector per frame:
+
+| Slice | Name | Unit | Contents |
+|---|---|---|---|
+| `[0:6]`   | `left_leg`    | rad  | hip pitch/roll/yaw, knee, ankle pitch/roll |
+| `[6:12]`  | `right_leg`   | rad  | hip pitch/roll/yaw, knee, ankle pitch/roll |
+| `[12:15]` | `waist`       | rad  | yaw, roll, pitch |
+| `[15:22]` | `left_arm`    | rad  | shoulder p/r/y, elbow, wrist r/p/y |
+| `[22:29]` | `right_arm`   | rad  | shoulder p/r/y, elbow, wrist r/p/y |
+| `[29:32]` | `imu_ang_vel` | rad/s| measured base angular velocity (wx, wy, wz) |
+| `[32:34]` | `imu_rp`      | rad  | measured base roll, pitch |
+
+`action_body` is a 35-dim flat vector per frame:
+
+| Slice | Name | Unit | Contents |
+|---|---|---|---|
+| `[0:6]`   | `left_leg`         | rad   | commanded joint targets — same joint order as state |
+| `[6:12]`  | `right_leg`        | rad   | (same) |
+| `[12:15]` | `waist`            | rad   | (same) |
+| `[15:22]` | `left_arm`         | rad   | (same) |
+| `[22:29]` | `right_arm`        | rad   | (same) |
+| `[29:31]` | `root_lin_vel_xy`  | m/s   | commanded base xy velocity (local frame) |
+| `[31:32]` | `root_height`      | m     | commanded base height |
+| `[32:34]` | `root_rp`          | rad   | commanded base roll, pitch |
+| `[34:35]` | `root_yaw_rate`    | rad/s | commanded base yaw rate |
+
+**Relationship between state and action:** `state_body[0:29]` and `action_body[0:29]` reference **the same 29 joints in the same order**. On that slice, the action vector is the controller's target for the next state — i.e. action *is* a one-step delayed observation. The remaining tail dimensions are intentionally **not** a delayed pair: the state tail is *measured* IMU (angular velocity + roll/pitch), while the action tail is *commanded* root motion (planar velocity, height, attitude, yaw rate). They encode different physical quantities, which is why state has 34 dims and action has 35, and they are kept in separate sub-modalities (`imu_*` vs `root_*`) so they are never conflated.
+
+The full joint-name list, limb groupings, and per-region tactile slices live in [deploy_real/data_utils/g1_schema.py](deploy_real/data_utils/g1_schema.py). The Redis wire format consumed by the trained ONNX policy is **unchanged**; reordering happens once, at recording time, inside [deploy_real/data_utils/episode_writer.py](deploy_real/data_utils/episode_writer.py).
 
 ### Validation
 ```bash
@@ -367,6 +401,25 @@ python server_low_level_g1_real.py --policy <ckpt> --use_hand --hand_type inspir
 The value `0` = fully open, `1000` = fully closed. Commands are sent at the teleop loop rate through Redis → `InspireHandController.ctrl_dual_hand()`.
 
 Custom Inspire hand IPs can be set via `--inspire_left_ip` and `--inspire_right_ip` on `server_low_level_g1_real.py`.
+
+### Tactile Sensing (RH56DFTP)
+
+Each Inspire RH56DFTP hand carries dense tactile arrays on every fingertip, finger nail, finger pad, the thumb middle section, and the palm — **1062 touch points (uint16, 0–4095) per hand**, read directly from Modbus registers `3000–5123` (PDF section 2.6.20). The wrapper reads the full block every cycle and exposes it as `InspireHandController.Ltactile` / `Rtactile` (flat `numpy.uint16` arrays of length 1062).
+
+Use `robot_control.inspire_hand_wrapper.slice_tactile(buf)` to reshape a flat buffer into per-region 2-D arrays:
+
+| Region                          | Shape | Points |
+|---------------------------------|-------|--------|
+| `<finger>_tip` (each of 5)      | 3×3   | 9      |
+| `<finger>_nail` (each of 5)     | 12×8  | 96     |
+| `<finger>_pad` (little/ring/middle/index) | 10×8  | 80 |
+| `thumb_pad`                     | 12×8  | 96     |
+| `thumb_middle`                  | 3×3   | 9      |
+| `palm`                          | 8×14  | 112    |
+
+During teleoperation, `server_low_level_g1_real.py` publishes the buffers to Redis as `tactile_hand_left_unitree_g1_with_hands` and `tactile_hand_right_unitree_g1_with_hands`. The data recorders (`server_data_record.py`, `server_data_record_d435.py`, `server_data_record_mid360.py`) then store them in each episode's `data.json` under `tactile_hand_left` / `tactile_hand_right` (one 1062-element list per frame). At ~2 KB per hand per frame this is left inline in the JSON for now.
+
+> **Note:** Reading the full tactile block costs ~9 chunked Modbus reads per hand per loop. The previous motor-current proxy (`REG_CURRENT` → `Ltau`/`Rtau`) is now off by default to free that bandwidth — pass `read_current=True` to `InspireHandController` if you still want it for debugging.
 
 ### Dependencies
 ```bash

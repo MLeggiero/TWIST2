@@ -124,7 +124,8 @@ class RealTimePolicyController(object):
                 self.hand_ctrl = InspireHandController(
                     left_ip=inspire_left_ip,
                     right_ip=inspire_right_ip,
-                    re_init=False)
+                    re_init=False,
+                    read_current=False)  # tactile is the default contact channel
             else:
                 self.hand_ctrl = Dex3_1_Controller(net, re_init=False)
 
@@ -232,11 +233,24 @@ class RealTimePolicyController(object):
                 
                 if self.use_hand:
                     left_hand_state, right_hand_state = self.hand_ctrl.get_hand_state()
-                    lh_pos, rh_pos, lh_temp, rh_temp, lh_tau, rh_tau = self.hand_ctrl.get_hand_all_state()
                     hand_left_json = json.dumps(left_hand_state.tolist())
                     hand_right_json = json.dumps(right_hand_state.tolist())
                     self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", hand_left_json)
                     self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", hand_right_json)
+
+                    # Inspire hands expose dense tactile sensors; publish them
+                    # alongside the joint state so the data recorder can pick
+                    # them up. The Dex3 wrapper has no tactile channel, so we
+                    # duck-type on the buffer attribute.
+                    if hasattr(self.hand_ctrl, "Ltactile"):
+                        all_state = self.hand_ctrl.get_hand_all_state()
+                        lh_tactile, rh_tactile = all_state[6], all_state[7]
+                        self.redis_pipeline.set(
+                            "tactile_hand_left_unitree_g1_with_hands",
+                            json.dumps(lh_tactile.tolist()))
+                        self.redis_pipeline.set(
+                            "tactile_hand_right_unitree_g1_with_hands",
+                            json.dumps(rh_tactile.tolist()))
                 
                 self.redis_pipeline.set("action_low_level_unitree_g1_with_hands", json.dumps(self.last_target_dof_pos.tolist()))
                 # execute the pipeline once here for setting the keys

@@ -9,6 +9,15 @@ from queue import Queue, Empty
 from threading import Thread
 from rich import print
 
+from data_utils.g1_schema import (
+    STATE_BODY_DIM,
+    ACTION_BODY_DIM,
+    reorder_state_body,
+    reorder_action_body,
+    build_modality_json,
+    build_schema_block,
+)
+
 class EpisodeWriter():
     def __init__(self, task_dir, frequency=30,
                  image_shape=(480, 640, 3),
@@ -38,6 +47,7 @@ class EpisodeWriter():
             print(f"==> episode directory does not exist, now create one.\n")
         self.data_info()
         self.text_desc()
+        self._write_modality_json()
 
         self.is_available = True  # Indicates whether the class is available for new operations
         # Initialize the queue and worker thread
@@ -57,7 +67,24 @@ class EpisodeWriter():
                 "image": {"width":self.image_shape[0], "height":self.image_shape[1], "fps":self.frequency},
             }
         
-    def text_desc(self, goal="pick up the red cup on the table.", 
+    def _write_modality_json(self):
+        """Write the LeRobot/GR00T-style ``meta/modality.json`` for this task.
+
+        Written once per task directory (on writer construction). Safe to
+        re-run -- it overwrites the file with the canonical schema each time
+        so the task always reflects the current code.
+        """
+        meta_dir = os.path.join(self.task_dir, "meta")
+        os.makedirs(meta_dir, exist_ok=True)
+        modality_path = os.path.join(meta_dir, "modality.json")
+        try:
+            with open(modality_path, "w", encoding="utf-8") as f:
+                json.dump(build_modality_json(), f, indent=4, ensure_ascii=False)
+            print(f"==> Wrote modality.json to {modality_path}")
+        except Exception as e:
+            print(f"==> Warning: failed to write modality.json: {e}")
+
+    def text_desc(self, goal="pick up the red cup on the table.",
                   desc="Pick up the cup from the table and place it in another position. The operation should be smooth and the water in the cup should not spill out",
                   steps="step1: searching for cups. step2: go to the target location. step3: pick up the cup"):
         self.text = {
@@ -142,6 +169,12 @@ class EpisodeWriter():
         state_hand_left = item_data.get('state_hand_left', None)
         state_hand_right = item_data.get('state_hand_right', None)
 
+        # tactile state (Inspire hands only). Each is a flat 1062-element list
+        # of uint16 touch values; reshape with
+        # robot_control.inspire_hand_wrapper.slice_tactile() at load time.
+        tactile_hand_left = item_data.get('tactile_hand_left', None)
+        tactile_hand_right = item_data.get('tactile_hand_right', None)
+
         # body and hand action
         action_body = item_data.get('action_body', None)
         action_hand_left = item_data.get('action_hand_left', None)
@@ -180,15 +213,39 @@ class EpisodeWriter():
             np.save(save_path, pointcloud.astype(np.float32))
             item_data['pointcloud'] = str(Path(save_path).relative_to(Path(self.json_path).parent))
 
-        # state and action are directly saved to the episode_data
+        # state and action are directly saved to the episode_data.
+        #
+        # The Redis wire format publishes state_body / action_body in an
+        # order dictated by the trained ONNX policy (IMU/root commands
+        # first, joints last). For the *recorded* dataset we reorder so
+        # the 29 joint dims come first, grouped by limb -- the labelled
+        # layout described in deploy_real/data_utils/g1_schema.py and the
+        # task's meta/modality.json. The Redis side is intentionally left
+        # alone so the live policy keeps working.
         if state_body is not None:
+            try:
+                if len(state_body) == STATE_BODY_DIM:
+                    state_body = reorder_state_body(state_body)
+            except Exception as e:
+                print(f"==> Warning: state_body reorder failed ({e}); "
+                      f"saving raw vector.")
             item_data['state_body'] = state_body
         if state_hand_left is not None:
             item_data['state_hand_left'] = state_hand_left
         if state_hand_right is not None:
             item_data['state_hand_right'] = state_hand_right
+        if tactile_hand_left is not None:
+            item_data['tactile_hand_left'] = tactile_hand_left
+        if tactile_hand_right is not None:
+            item_data['tactile_hand_right'] = tactile_hand_right
 
         if action_body is not None:
+            try:
+                if len(action_body) == ACTION_BODY_DIM:
+                    action_body = reorder_action_body(action_body)
+            except Exception as e:
+                print(f"==> Warning: action_body reorder failed ({e}); "
+                      f"saving raw vector.")
             item_data['action_body'] = action_body
         if action_hand_left is not None:
             item_data['action_hand_left'] = action_hand_left
@@ -224,6 +281,9 @@ class EpisodeWriter():
         self.data['info'] = self.info
         self.data['text'] = self.text
         self.data['label'] = self.label
+        # Self-describing schema embedded inline so each episode file is
+        # readable in isolation, in addition to the per-task meta/modality.json.
+        self.data['schema'] = build_schema_block()
         self.data['data'] = self.episode_data
         with open(self.json_path, 'w', encoding='utf-8') as jsonf:
             jsonf.write(json.dumps(self.data, indent=4, ensure_ascii=False))

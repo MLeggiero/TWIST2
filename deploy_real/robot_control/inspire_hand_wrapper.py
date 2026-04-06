@@ -47,13 +47,61 @@ REG_ERR = 1606       # 3 registers, byte-packed -> 6 values
 REG_STATUS = 1612    # 3 registers, byte-packed -> 6 values
 REG_TEMPERATURE = 1618  # 3 registers, byte-packed -> 6 values
 
+# Tactile sensor registers (PDF section 2.6.20).
+# Address values are byte addresses; each Modbus holding register holds 2 bytes
+# starting at the requested byte address. Each tactile point is a uint16 stored
+# little-endian within the byte stream, range 0-4095.
+REG_TACTILE_START = 3000
+REG_TACTILE_END = 5123  # inclusive last byte
+TACTILE_TOTAL_REGS = (REG_TACTILE_END - REG_TACTILE_START + 1) // 2  # 1062
+MODBUS_MAX_REGS = 120  # safe margin under the 125-register Modbus limit
+
+# (region_name, start_byte, n_points, (rows, cols)) — total points = 1062 per hand.
+TACTILE_LAYOUT = [
+    ("little_tip",     3000,   9, (3, 3)),
+    ("little_nail",    3018,  96, (12, 8)),
+    ("little_pad",     3210,  80, (10, 8)),
+    ("ring_tip",       3370,   9, (3, 3)),
+    ("ring_nail",      3388,  96, (12, 8)),
+    ("ring_pad",       3580,  80, (10, 8)),
+    ("middle_tip",     3740,   9, (3, 3)),
+    ("middle_nail",    3758,  96, (12, 8)),
+    ("middle_pad",     3950,  80, (10, 8)),
+    ("index_tip",      4110,   9, (3, 3)),
+    ("index_nail",     4128,  96, (12, 8)),
+    ("index_pad",      4320,  80, (10, 8)),
+    ("thumb_tip",      4480,   9, (3, 3)),
+    ("thumb_nail",     4498,  96, (12, 8)),
+    ("thumb_middle",   4690,   9, (3, 3)),
+    ("thumb_pad",      4708,  96, (12, 8)),
+    ("palm",           4900, 112, (8, 14)),
+]
+
+
+def slice_tactile(flat_buf):
+    """Reshape a flat 1062-element tactile buffer into named region arrays.
+
+    Args:
+        flat_buf: 1-D array of length TACTILE_TOTAL_REGS (uint16 touch values),
+            laid out by ascending byte address.
+
+    Returns:
+        dict mapping region name -> 2-D numpy array with the layout's shape.
+    """
+    out = {}
+    for name, start_byte, n_points, shape in TACTILE_LAYOUT:
+        offset = (start_byte - REG_TACTILE_START) // 2
+        region = flat_buf[offset:offset + n_points]
+        out[name] = region.reshape(shape)
+    return out
+
 DEFAULT_QPOS_LEFT = DEFAULT_HAND_POSE["unitree_g1_inspire"]["left"]["open"]
 DEFAULT_QPOS_RIGHT = DEFAULT_HAND_POSE["unitree_g1_inspire"]["right"]["open"]
 
 
 class InspireHandController:
     def __init__(self, left_ip='192.168.123.210', right_ip='192.168.123.211',
-                 port=6000, device_id=1, re_init=True):
+                 port=6000, device_id=1, re_init=True, read_current=False):
         """
         Initialize Inspire hand controller via Modbus TCP.
 
@@ -63,12 +111,17 @@ class InspireHandController:
             port: Modbus TCP port (default 6000)
             device_id: Modbus device ID (default 1)
             re_init: Whether to clear errors and move to default position
+            read_current: If True, also read REG_CURRENT each cycle and expose
+                it as Ltau/Rtau (motor current in mA, a noisy proxy for joint
+                effort). Off by default to free Modbus bandwidth for the
+                tactile sensor reads.
         """
         print("Initialize InspireHandController...")
         print(f"  Left hand IP: {left_ip}:{port}")
         print(f"  Right hand IP: {right_ip}:{port}")
 
         self.device_id = device_id
+        self.read_current = read_current
 
         self.left_client = ModbusTcpClient(left_ip, port=port)
         self.right_client = ModbusTcpClient(right_ip, port=port)
@@ -97,6 +150,10 @@ class InspireHandController:
         self.Rtemp = np.zeros(Inspire_Num_Motors, dtype=np.float32)
         self.Ltau = np.zeros(Inspire_Num_Motors, dtype=np.float32)
         self.Rtau = np.zeros(Inspire_Num_Motors, dtype=np.float32)
+        # Tactile buffers: flat uint16 arrays of length 1062 per hand. Use
+        # slice_tactile() to reshape into named regions.
+        self.Ltactile = np.zeros(TACTILE_TOTAL_REGS, dtype=np.uint16)
+        self.Rtactile = np.zeros(TACTILE_TOTAL_REGS, dtype=np.uint16)
 
         # Read initial state
         self.get_hand_state()
@@ -139,6 +196,45 @@ class InspireHandController:
             print(f"Exception reading byte registers at {address}: {e}")
             return [0] * (count * 2)
 
+    def _read_tactile(self, client, prev_buf):
+        """Read the full tactile sensor block from one hand.
+
+        Reads TACTILE_TOTAL_REGS (1062) holding registers in chunks of
+        MODBUS_MAX_REGS, decodes each register as two bytes (high, low) of the
+        underlying byte stream, then reinterprets the byte stream as
+        little-endian uint16 touch values per the PDF section 2.6.20.
+
+        Args:
+            client: pymodbus ModbusTcpClient for the target hand.
+            prev_buf: previous tactile buffer (returned on transient error so
+                consumers do not see momentary zeros mid-episode).
+
+        Returns:
+            np.ndarray of shape (TACTILE_TOTAL_REGS,) and dtype uint16.
+        """
+        try:
+            byte_buf = bytearray(TACTILE_TOTAL_REGS * 2)
+            n_remaining = TACTILE_TOTAL_REGS
+            reg_addr = REG_TACTILE_START
+            byte_offset = 0
+            while n_remaining > 0:
+                chunk = min(MODBUS_MAX_REGS, n_remaining)
+                response = client.read_holding_registers(
+                    reg_addr, chunk, slave=self.device_id)
+                if response.isError():
+                    print(f"Error reading tactile registers at {reg_addr}")
+                    return prev_buf
+                for reg in response.registers:
+                    byte_buf[byte_offset] = (reg >> 8) & 0xFF
+                    byte_buf[byte_offset + 1] = reg & 0xFF
+                    byte_offset += 2
+                reg_addr += chunk
+                n_remaining -= chunk
+            return np.frombuffer(bytes(byte_buf), dtype='<u2').copy()
+        except Exception as e:
+            print(f"Exception reading tactile registers: {e}")
+            return prev_buf
+
     def get_hand_state(self):
         """Read current hand joint angles.
 
@@ -154,11 +250,18 @@ class InspireHandController:
         self.Lpos = self.left_hand_state_array.copy()
         self.Rpos = self.right_hand_state_array.copy()
 
-        # Read motor current (proxy for torque estimation)
-        left_current = self._read_registers_signed(self.left_client, REG_CURRENT, 6)
-        right_current = self._read_registers_signed(self.right_client, REG_CURRENT, 6)
-        self.Ltau = np.array(left_current, dtype=np.float32)
-        self.Rtau = np.array(right_current, dtype=np.float32)
+        # Read tactile sensor block from each hand. This replaces motor current
+        # as the default contact-sensing channel.
+        self.Ltactile = self._read_tactile(self.left_client, self.Ltactile)
+        self.Rtactile = self._read_tactile(self.right_client, self.Rtactile)
+
+        # Optional: motor current (proxy for joint effort, in mA). Off by default
+        # to keep the per-loop Modbus budget available for tactile reads.
+        if self.read_current:
+            left_current = self._read_registers_signed(self.left_client, REG_CURRENT, 6)
+            right_current = self._read_registers_signed(self.right_client, REG_CURRENT, 6)
+            self.Ltau = np.array(left_current, dtype=np.float32)
+            self.Rtau = np.array(right_current, dtype=np.float32)
 
         # Read temperature (byte-packed: 3 registers -> 6 bytes)
         left_temp = self._read_registers_bytes(self.left_client, REG_TEMPERATURE, 3)
@@ -172,11 +275,19 @@ class InspireHandController:
         """Get complete hand telemetry.
 
         Returns:
-            (Lpos, Rpos, Ltemp, Rtemp, Ltau, Rtau): 6-element arrays each
+            tuple of (Lpos, Rpos, Ltemp, Rtemp, Ltau, Rtau, Ltactile, Rtactile)
+              - Lpos/Rpos:     6-element float32 joint angles (0-1000)
+              - Ltemp/Rtemp:   6-element float32 actuator temperatures (deg C)
+              - Ltau/Rtau:     6-element float32 motor currents (mA), only
+                               refreshed when read_current=True; otherwise
+                               returns the last (zero) value.
+              - Ltactile/Rtactile: 1062-element uint16 flat tactile buffers.
+                               Use slice_tactile() to reshape into named regions.
         """
         return (self.Lpos.copy(), self.Rpos.copy(),
                 self.Ltemp.copy(), self.Rtemp.copy(),
-                self.Ltau.copy(), self.Rtau.copy())
+                self.Ltau.copy(), self.Rtau.copy(),
+                self.Ltactile.copy(), self.Rtactile.copy())
 
     def ctrl_dual_hand(self, left_q_target, right_q_target):
         """Send angle commands to both hands.
@@ -244,11 +355,25 @@ if __name__ == "__main__":
     hand_ctrl = InspireHandController(
         left_ip=args.left_ip,
         right_ip=args.right_ip,
-        port=args.port
+        port=args.port,
+        read_current=False,
     )
 
-    # Test: gradually close then open
-    print("Running test sequence...")
+    # Sanity check the tactile buffer shape and dtype.
+    assert hand_ctrl.Ltactile.shape == (TACTILE_TOTAL_REGS,), hand_ctrl.Ltactile.shape
+    assert hand_ctrl.Ltactile.dtype == np.uint16, hand_ctrl.Ltactile.dtype
+    print(f"Tactile buffer length: {hand_ctrl.Ltactile.shape[0]} touch points per hand")
+
+    # Loop-rate sanity check: time 100 calls to get_hand_state().
+    t0 = time.time()
+    for _ in range(100):
+        hand_ctrl.get_hand_state()
+    elapsed = time.time() - t0
+    print(f"100 get_hand_state() calls in {elapsed:.2f}s "
+          f"({100.0 / elapsed:.1f} Hz achieved with tactile reads)")
+
+    # Test: gradually close then open and report tactile activity.
+    print("Running test sequence (press a fingertip / palm pad to see tactile change)...")
     for i in range(11):
         angle = int(i * 100)  # 0 to 1000
         left_target = [angle] * 6
@@ -256,7 +381,9 @@ if __name__ == "__main__":
         hand_ctrl.ctrl_dual_hand(left_target, right_target)
         left_state, right_state = hand_ctrl.get_hand_state()
         print(f"Step {i}: target={angle}, "
-              f"Left={left_state[:3]}, Right={right_state[:3]}")
+              f"Left angles={left_state[:3]}, "
+              f"Ltactile max={int(hand_ctrl.Ltactile.max())} sum={int(hand_ctrl.Ltactile.sum())}, "
+              f"Rtactile max={int(hand_ctrl.Rtactile.max())} sum={int(hand_ctrl.Rtactile.sum())}")
         time.sleep(0.3)
 
     # Return to open

@@ -110,18 +110,40 @@ Each frame in `data.json`:
   "rgb": "rgb/000000.jpg",
   "depth": "depth/000000.png",
   "t_img": 1707000000000,
-  "state_body": [...],
+  "state_body": [/* 34 floats: 29 joint positions then 3 imu_ang_vel + 2 imu_rp */],
   "state_hand_left": [...],
   "state_hand_right": [...],
   "state_neck": [...],
+  "tactile_hand_left":  [/* 1062 uint16 touch values, Inspire only */],
+  "tactile_hand_right": [/* 1062 uint16 touch values, Inspire only */],
   "t_state": ...,
-  "action_body": [...],
+  "action_body": [/* 35 floats: 29 joint targets then 2 root_lin_vel_xy + 1 root_height + 2 root_rp + 1 root_yaw_rate */],
   "action_hand_left": [...],
   "action_hand_right": [...],
   "action_neck": [...],
   "t_action": ...
 }
 ```
+
+### Labelled state / action layout (joint-first)
+
+Recorded `state_body` and `action_body` use a **joint-first** layout: the first 29 dims of both vectors are joint positions in the same order, grouped by limb (`left_leg[0:6]`, `right_leg[6:12]`, `waist[12:15]`, `left_arm[15:22]`, `right_arm[22:29]`). On that 29-dim slice, `action_body[i]` is the controller's target for `state_body[i]` at the next control step. The remaining tail dims are *not* a delayed pair: `state_body[29:34]` is measured IMU (`ang_vel[3] + rp[2]`), and `action_body[29:35]` is commanded root motion (`vel_xy[2] + height[1] + rp[2] + yaw_rate[1]`). Each task directory also contains a `meta/modality.json` file with the same slicing in LeRobot/Isaac-GR00T format, and every `data.json` embeds an inline `schema` block. See the **Labelled state / action layout** section in [`README.md`](../README.md#realsense-d435i-camera-integration) and [deploy_real/data_utils/g1_schema.py](../deploy_real/data_utils/g1_schema.py) for the full joint name list.
+
+### Tactile fields (Inspire RH56DFTP only)
+
+When recording with the **Inspire RH56DFTP** dexterous hands, each frame includes `tactile_hand_left` and `tactile_hand_right`. Each is a flat list of **1062 uint16 values (range 0–4095)** from Modbus registers `3000–5123` covering the fingertip, finger nail, finger pad, thumb middle section, and palm sensor arrays (PDF section 2.6.20). The flat layout is laid out by ascending byte address — use `robot_control.inspire_hand_wrapper.slice_tactile()` to reshape into per-region 2-D arrays:
+
+```python
+from robot_control.inspire_hand_wrapper import slice_tactile
+import numpy as np
+
+flat = np.asarray(frame["tactile_hand_left"], dtype=np.uint16)
+regions = slice_tactile(flat)
+print(regions["index_tip"].shape)  # (3, 3)
+print(regions["palm"].shape)       # (8, 14)
+```
+
+The region table is documented in the main [`README.md`](../README.md#inspire-hand-control) under *Inspire Hand Control → Tactile Sensing*. Tactile is published to Redis by `server_low_level_g1_real.py` under the keys `tactile_hand_left_unitree_g1_with_hands` / `tactile_hand_right_unitree_g1_with_hands`. With the Dex3 hands these fields are absent from recorded frames.
 
 ## Configuration
 
