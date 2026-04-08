@@ -25,16 +25,23 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
 # ---------- Dimension constants ----------
-DIM_STATE_BODY = 34       # ang_vel(3) + roll_pitch(2) + dof_pos(29)
+DIM_STATE_BODY = 34       # joint-first labelled order: dof_pos(29) + ang_vel(3) + rp(2)
 DIM_STATE_HAND_DEX3 = 7   # per hand (Dex3)
 DIM_STATE_HAND_INSPIRE = 6  # per hand (Inspire)
 DIM_STATE_NECK = 2
 
-DIM_ACTION_BODY = 35      # high-level teleop target
+DIM_ACTION_BODY = 35      # joint-first labelled order: dof_pos(29) + vel_xy(2) + z(1) + rp(2) + yaw_rate(1)
 DIM_ACTION_HAND_DEX3 = 7  # per hand (Dex3)
 DIM_ACTION_HAND_INSPIRE = 6  # per hand (Inspire)
 DIM_ACTION_NECK = 2
 DIM_ACTION_LOW_LEVEL = 29  # low-level motor commands
+
+# Tactile (Inspire RH56DFTP only): 1062 uint16 touch points per hand,
+# range 0-4095. Stored as int32 in the parquet because LeRobot's feature
+# validation only accepts the standard numpy float/int dtypes -- int32 is
+# the smallest universally-supported integer type that fits the range with
+# room to spare.
+DIM_TACTILE = 1062
 
 
 def parse_args():
@@ -64,6 +71,14 @@ def parse_args():
                         help="Use video storage (default)")
     parser.add_argument("--no_videos", action="store_false", dest="use_videos",
                         help="Use image storage instead of video")
+
+    # Tactile inclusion: only meaningful for Inspire hands. Default 'auto'
+    # detects from the first frame of the first episode -- old recordings
+    # without tactile fields are exported as before, new ones get the two
+    # observation.tactile.* features.
+    parser.add_argument("--include_tactile", type=str, default="auto",
+                        choices=["auto", "yes", "no"],
+                        help="Include Inspire tactile arrays as observation.tactile.* features")
 
     parser.add_argument("--push_to_hub", action="store_true", default=False,
                         help="Push dataset to HuggingFace Hub")
@@ -124,6 +139,30 @@ def build_state(frame: dict, idx: int, hand_type: str) -> np.ndarray:
     return np.concatenate([state_body, hand_left, hand_right, neck])
 
 
+def build_tactile(frame: dict, idx: int, side: str) -> np.ndarray:
+    """Build a single-hand tactile vector as int32 with shape (1062,).
+
+    ``side`` is "left" or "right". Missing or wrong-shape values are
+    zero-filled with a one-line warning so old episodes (recorded before
+    tactile sensing was added) still convert without aborting the run.
+    """
+    field_name = f"tactile_hand_{side}"
+    value = frame.get(field_name)
+    if value is None:
+        warnings.warn(
+            f"Frame {idx}: '{field_name}' is None, zero-filling ({DIM_TACTILE}d)"
+        )
+        return np.zeros(DIM_TACTILE, dtype=np.int32)
+    arr = np.asarray(value, dtype=np.int32)
+    if arr.shape != (DIM_TACTILE,):
+        warnings.warn(
+            f"Frame {idx}: '{field_name}' has shape {arr.shape}, "
+            f"expected ({DIM_TACTILE},). Zero-filling."
+        )
+        return np.zeros(DIM_TACTILE, dtype=np.int32)
+    return arr
+
+
 def build_action(frame: dict, idx: int, action_mode: str, include_hand: bool, hand_type: str) -> np.ndarray:
     """Build action vector based on mode and hand flag."""
     hand_dim = DIM_ACTION_HAND_INSPIRE if hand_type == "inspire" else DIM_ACTION_HAND_DEX3
@@ -177,6 +216,26 @@ def main():
     print(f"Action mode: {args.action_mode}, hand_type: {args.hand_type}, include_hand: {args.include_hand}")
     print(f"Action dim: {action_dim}, State dim: {state_dim}")
 
+    # Decide whether to include tactile features. Only Inspire hands
+    # produce tactile data; for Dex3 we always disable. In 'auto' mode we
+    # peek at the first frame of the first episode and turn tactile on iff
+    # the field is present and has the expected length.
+    if args.hand_type != "inspire":
+        include_tactile = False
+        if args.include_tactile == "yes":
+            print("Warning: --include_tactile=yes ignored because hand_type != inspire")
+    elif args.include_tactile == "yes":
+        include_tactile = True
+    elif args.include_tactile == "no":
+        include_tactile = False
+    else:  # auto
+        first_frame = first_data["data"][0]
+        tac_left = first_frame.get("tactile_hand_left")
+        include_tactile = (
+            tac_left is not None and len(tac_left) == DIM_TACTILE
+        )
+    print(f"Include tactile: {include_tactile}")
+
     # Define features
     vision_dtype = "video" if args.use_videos else "image"
     features = {
@@ -196,6 +255,18 @@ def main():
             "names": ["action"],
         },
     }
+
+    if include_tactile:
+        features["observation.tactile.left_hand"] = {
+            "dtype": "int32",
+            "shape": (DIM_TACTILE,),
+            "names": ["tactile"],
+        }
+        features["observation.tactile.right_hand"] = {
+            "dtype": "int32",
+            "shape": (DIM_TACTILE,),
+            "names": ["tactile"],
+        }
 
     # Create dataset
     dataset = LeRobotDataset.create(
@@ -249,6 +320,9 @@ def main():
                 "action": action,
                 "task": args.task_name,
             }
+            if include_tactile:
+                frame_data["observation.tactile.left_hand"] = build_tactile(frame, idx, "left")
+                frame_data["observation.tactile.right_hand"] = build_tactile(frame, idx, "right")
             dataset.add_frame(frame_data)
 
         dataset.save_episode()
@@ -278,6 +352,7 @@ def main():
     print(f"  Action mode: {args.action_mode}")
     print(f"  Hand type: {args.hand_type}")
     print(f"  Include hand: {args.include_hand}")
+    print(f"  Include tactile: {include_tactile}")
     print(f"  Output:     {output_dir}")
     print("=" * 60)
 

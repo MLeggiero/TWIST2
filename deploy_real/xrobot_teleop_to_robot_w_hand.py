@@ -109,7 +109,7 @@ def extract_mimic_obs_whole_body(qpos, last_qpos, dt=1/30):
 
 class StateMachine:
     def __init__(self, enable_smooth=False, smooth_window_size=5, use_pinch=False,
-                 use_finger_tracking=False):
+                 use_finger_tracking=False, hand_type='dex3', grip_thumb=False):
         """
         State process for teleoperation:
         idle -> teleop -> pause -> teleop ... -> idle -> exit
@@ -130,11 +130,22 @@ class StateMachine:
         self.current_neck_data = None
         self.last_neck_data = None
 
+        # Hand type
+        self.hand_type = hand_type
+
         # Hand state - interpolation values (0.0 = open, 1.0 = closed)
-        self.hand_left_position = 0.0  # 0.0 = fully open, 1.0 = fully closed
+        self.hand_left_position = 0.0  # 0.0 = fully open, 1.0 = fully closed (Dex3)
         self.hand_right_position = 0.0
+        # Inspire split control: separate finger (4 DOF) and thumb (2 DOF)
+        self.hand_left_finger_position = 0.0
+        self.hand_left_thumb_position = 0.0
+        self.hand_left_thumb_bend_position = 1.0  # 1.0 = fully bent (1000), 0.0 = open (0)
+        self.hand_right_finger_position = 0.0
+        self.hand_right_thumb_position = 0.0
+        self.hand_right_thumb_bend_position = 1.0  # 1.0 = fully bent (1000), 0.0 = open (0)
         self.use_pinch = use_pinch
-        # Hand control parameters
+        self.grip_thumb = grip_thumb  # Whether grip button also controls thumb rotation
+        # Hand control parameters (Dex3 step-based)
         self.hand_movement_step = 0.05  # 5% movement per press/hold
         
         # Finger tracking
@@ -197,30 +208,61 @@ class StateMachine:
             elif self.state == "pause":
                 self.state = "teleop"
 
-        # Handle hand control - continuous interpolation
-        # Right hand control
-        if right_index_trig_current:  # Close right hand
-            new_position = min(1.0, self.hand_right_position + self.hand_movement_step)
-            if new_position != self.hand_right_position:
-                self.hand_right_position = new_position
-                print(f"Right hand closing: {self.hand_right_position:.1f}")
-        elif right_grip_current:  # Open right hand
-            new_position = max(0.0, self.hand_right_position - self.hand_movement_step)
-            if new_position != self.hand_right_position:
-                self.hand_right_position = new_position
-                print(f"Right hand opening: {self.hand_right_position:.1f}")
-        
-        # Left hand control
-        if left_index_trig_current:  # Close left hand
-            new_position = min(1.0, self.hand_left_position + self.hand_movement_step)
-            if new_position != self.hand_left_position:
-                self.hand_left_position = new_position
-                print(f"Left hand closing: {self.hand_left_position:.1f}")
-        elif left_grip_current:  # Open left hand
-            new_position = max(0.0, self.hand_left_position - self.hand_movement_step)
-            if new_position != self.hand_left_position:
-                self.hand_left_position = new_position
-                print(f"Left hand opening: {self.hand_left_position:.1f}")
+        # Handle hand control
+        if self.hand_type == 'inspire':
+            # Inspire: proportional analog control
+            # Trigger (index_trig) = 4 fingers
+            # Each joystick controls its respective hand's thumb:
+            #   X axis = thumb rotation, Y axis = thumb bend
+            # --grip_thumb flag: grip button also controls thumb rotation
+            # Invert PICO input: trigger 1.0 (pressed) → position 0.0 (closed)
+            self.hand_right_finger_position = 1.0 - float(right_index_trig_current)
+            self.hand_left_finger_position = 1.0 - float(left_index_trig_current)
+
+            # Right joystick → right thumb
+            right_axis = controller_data.get('RightController', {}).get('axis', [0.0, 0.0])
+            if len(right_axis) >= 2:
+                self.hand_right_thumb_bend_position = np.clip(0.5 - right_axis[1] * 0.5, 0.0, 1.0)
+                joystick_thumb_rot = np.clip(0.5 + right_axis[0] * 0.5, 0.0, 1.0)
+                if self.grip_thumb:
+                    self.hand_right_thumb_position = max(joystick_thumb_rot, 1.0 - float(right_grip_current))
+                else:
+                    self.hand_right_thumb_position = joystick_thumb_rot
+
+            # Left joystick → left thumb
+            left_axis = controller_data.get('LeftController', {}).get('axis', [0.0, 0.0])
+            if len(left_axis) >= 2:
+                self.hand_left_thumb_bend_position = np.clip(0.5 - left_axis[1] * 0.5, 0.0, 1.0)
+                joystick_thumb_rot = np.clip(0.5 - left_axis[0] * 0.5, 0.0, 1.0)
+                if self.grip_thumb:
+                    self.hand_left_thumb_position = max(joystick_thumb_rot, 1.0 - float(left_grip_current))
+                else:
+                    self.hand_left_thumb_position = joystick_thumb_rot
+        else:
+            # Dex3: step-based interpolation (original behavior)
+            # Right hand control
+            if right_index_trig_current:  # Close right hand
+                new_position = min(1.0, self.hand_right_position + self.hand_movement_step)
+                if new_position != self.hand_right_position:
+                    self.hand_right_position = new_position
+                    print(f"Right hand closing: {self.hand_right_position:.1f}")
+            elif right_grip_current:  # Open right hand
+                new_position = max(0.0, self.hand_right_position - self.hand_movement_step)
+                if new_position != self.hand_right_position:
+                    self.hand_right_position = new_position
+                    print(f"Right hand opening: {self.hand_right_position:.1f}")
+
+            # Left hand control
+            if left_index_trig_current:  # Close left hand
+                new_position = min(1.0, self.hand_left_position + self.hand_movement_step)
+                if new_position != self.hand_left_position:
+                    self.hand_left_position = new_position
+                    print(f"Left hand closing: {self.hand_left_position:.1f}")
+            elif left_grip_current:  # Open left hand
+                new_position = max(0.0, self.hand_left_position - self.hand_movement_step)
+                if new_position != self.hand_left_position:
+                    self.hand_left_position = new_position
+                    print(f"Left hand opening: {self.hand_left_position:.1f}")
         
         # Extract velocity commands from controller axes
         self._update_velocity_commands(controller_data)
@@ -235,15 +277,16 @@ class StateMachine:
         left_axis = controller_data.get('LeftController', {}).get('axis', [0.0, 0.0])
         right_axis = controller_data.get('RightController', {}).get('axis', [0.0, 0.0])
         
-        # Use left stick for xy movement, right stick for yaw rotation
-        if len(left_axis) >= 2 and len(right_axis) >= 2:
-            # Scale factors for velocity commands
+        if self.hand_type == 'inspire':
+            # Both joysticks used for thumb control in Inspire mode, no velocity commands
+            self.velocity_commands[:] = 0.0
+        elif len(left_axis) >= 2 and len(right_axis) >= 2:
+            # Use left stick for xy movement, right stick X for yaw rotation
             xy_scale = 2.0  # m/s
             yaw_scale = 3.0  # rad/s
-            
-            self.velocity_commands[0] = left_axis[1] * xy_scale   # forward/backward (y axis inverted)
-            self.velocity_commands[1] = -left_axis[0] * xy_scale  # left/right (x axis inverted)
-            self.velocity_commands[2] = -right_axis[0] * yaw_scale  # yaw rotation (x axis inverted)
+            self.velocity_commands[0] = left_axis[1] * xy_scale   # forward/backward
+            self.velocity_commands[1] = -left_axis[0] * xy_scale  # left/right
+            self.velocity_commands[2] = -right_axis[0] * yaw_scale  # yaw rotation
     
     def has_state_changed(self):
         """Check if state has changed since last update"""
@@ -319,8 +362,27 @@ class StateMachine:
             left_pose = self._tracked_left_hand_pose if self._tracked_left_hand_pose is not None else left_default
             right_pose = self._tracked_right_hand_pose if self._tracked_right_hand_pose is not None else right_default
             return left_pose, right_pose
-        
-        # Original button-based interpolation
+
+        # Inspire RH56DFTP: 1000 = open, 0 = closed
+        # trigger pressed (1.0) → close (0), released (0.0) → open (1000)
+        if self.hand_type == 'inspire':
+            l_finger = self.hand_left_finger_position * 1000
+            l_thumb = self.hand_left_thumb_position * 1000
+            l_thumb_bend = self.hand_left_thumb_bend_position * 1000
+            r_finger = self.hand_right_finger_position * 1000
+            r_thumb = self.hand_right_thumb_position * 1000
+            r_thumb_bend = self.hand_right_thumb_bend_position * 1000
+            left_pose = np.array([
+                l_finger, l_finger, l_finger, l_finger,  # pinky, ring, middle, index
+                l_thumb_bend, l_thumb,                       # thumb bend (joystick), thumb rotation
+            ], dtype=np.float32)
+            right_pose = np.array([
+                r_finger, r_finger, r_finger, r_finger,  # pinky, ring, middle, index
+                r_thumb_bend, r_thumb,                       # thumb bend (joystick), thumb rotation
+            ], dtype=np.float32)
+            return left_pose, right_pose
+
+        # Dex3: button-based interpolation (original behavior)
         use_pinch = self.use_pinch
         # Get open and closed poses
         
@@ -441,7 +503,9 @@ class XRobotTeleopToRobot:
             enable_smooth=args.smooth,
             smooth_window_size=args.smooth_window_size,
             use_pinch=args.pinch_mode,
-            use_finger_tracking=self.use_finger_tracking
+            use_finger_tracking=self.use_finger_tracking,
+            hand_type=self.hand_type,
+            grip_thumb=args.grip_thumb,
         )
         self.rate = None
         
@@ -985,6 +1049,12 @@ def parse_arguments():
         "--finger_tracking",
         action="store_true",
         help="Use Pico 4 Ultra finger tracking for Inspire hand control instead of controller buttons.",
+        default=False,
+    )
+    parser.add_argument(
+        "--grip_thumb",
+        action="store_true",
+        help="Also use grip button for thumb rotation (combined with joystick). Default: joystick-only thumb control.",
         default=False,
     )
     return parser.parse_args()

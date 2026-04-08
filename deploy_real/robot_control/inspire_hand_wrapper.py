@@ -26,7 +26,30 @@ import struct
 import time
 from enum import IntEnum
 
-from pymodbus.client import ModbusTcpClient
+try:
+    from pymodbus.client import ModbusTcpClient
+except ImportError:
+    from pymodbus.client.sync import ModbusTcpClient
+
+# Detect pymodbus API flavour by inspecting function signatures.
+# - pymodbus 2.x: unit= for device ID, count as positional arg
+# - pymodbus 3.0-3.6: slave= for device ID, count as positional arg
+# - pymodbus 3.7+: dev_id= for device ID, count= as keyword arg
+import inspect as _inspect
+_write_params = set(_inspect.signature(ModbusTcpClient.write_registers).parameters)
+_read_params = set(_inspect.signature(ModbusTcpClient.read_holding_registers).parameters)
+
+if 'dev_id' in _write_params:
+    _DEVICE_ID_KEY = 'dev_id'
+elif 'slave' in _write_params:
+    _DEVICE_ID_KEY = 'slave'
+elif 'unit' in _write_params:
+    _DEVICE_ID_KEY = 'unit'
+else:
+    _DEVICE_ID_KEY = None
+
+# In pymodbus 3.7+, count must be passed as keyword to read_holding_registers
+_READ_COUNT_KEYWORD = 'count' in _read_params
 
 from data_utils.params import DEFAULT_HAND_POSE
 
@@ -121,6 +144,7 @@ class InspireHandController:
         print(f"  Right hand IP: {right_ip}:{port}")
 
         self.device_id = device_id
+        self._dev_kwargs = {_DEVICE_ID_KEY: device_id} if _DEVICE_ID_KEY else {}
         self.read_current = read_current
 
         self.left_client = ModbusTcpClient(left_ip, port=port)
@@ -138,8 +162,8 @@ class InspireHandController:
 
         # Clear errors on init
         if re_init:
-            self.left_client.write_register(REG_CLEAR_ERROR, 1, slave=self.device_id)
-            self.right_client.write_register(REG_CLEAR_ERROR, 1, slave=self.device_id)
+            self.left_client.write_register(REG_CLEAR_ERROR, 1, **self._dev_kwargs)
+            self.right_client.write_register(REG_CLEAR_ERROR, 1, **self._dev_kwargs)
 
         # State arrays
         self.left_hand_state_array = np.zeros(Inspire_Num_Motors, dtype=np.float32)
@@ -165,10 +189,17 @@ class InspireHandController:
 
         print("Initialize InspireHandController OK!\n")
 
+    def _read_holding(self, client, address, count):
+        """Read holding registers with correct API for installed pymodbus version."""
+        if _READ_COUNT_KEYWORD:
+            return client.read_holding_registers(address, count=count, **self._dev_kwargs)
+        else:
+            return client.read_holding_registers(address, count, **self._dev_kwargs)
+
     def _read_registers_signed(self, client, address, count):
         """Read Modbus registers and interpret as signed int16."""
         try:
-            response = client.read_holding_registers(address, count, slave=self.device_id)
+            response = self._read_holding(client, address, count)
             if not response.isError():
                 packed = struct.pack('>' + 'H' * count, *response.registers)
                 return list(struct.unpack('>' + 'h' * count, packed))
@@ -182,7 +213,7 @@ class InspireHandController:
     def _read_registers_bytes(self, client, address, count):
         """Read Modbus registers and unpack as individual bytes (2 bytes per register)."""
         try:
-            response = client.read_holding_registers(address, count, slave=self.device_id)
+            response = self._read_holding(client, address, count)
             if not response.isError():
                 byte_list = []
                 for reg in response.registers:
@@ -219,8 +250,7 @@ class InspireHandController:
             byte_offset = 0
             while n_remaining > 0:
                 chunk = min(MODBUS_MAX_REGS, n_remaining)
-                response = client.read_holding_registers(
-                    reg_addr, chunk, slave=self.device_id)
+                response = self._read_holding(client, reg_addr, chunk)
                 if response.isError():
                     print(f"Error reading tactile registers at {reg_addr}")
                     return prev_buf
@@ -300,8 +330,8 @@ class InspireHandController:
         right_angles = [int(np.clip(v, 0, 1000)) for v in right_q_target]
 
         try:
-            self.left_client.write_registers(REG_ANGLE_SET, left_angles, slave=self.device_id)
-            self.right_client.write_registers(REG_ANGLE_SET, right_angles, slave=self.device_id)
+            self.left_client.write_registers(REG_ANGLE_SET, left_angles, **self._dev_kwargs)
+            self.right_client.write_registers(REG_ANGLE_SET, right_angles, **self._dev_kwargs)
         except Exception as e:
             print(f"Error writing hand commands: {e}")
 
