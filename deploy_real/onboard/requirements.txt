@@ -1,4 +1,3 @@
-pyrealsense2
 pyzmq<27
 numpy
 opencv-python-headless
