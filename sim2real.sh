@@ -14,7 +14,7 @@ python server_low_level_g1_real.py \
     --policy ${ckpt_path} \
     --net ${net} \
     --device cuda \
-    --use_hand \
-    --hand_type inspire \
+    #--use_hand \
+    #--hand_type inspire \
     # --smooth_body 0.5
     # --record_proprio \
