@@ -71,6 +71,58 @@ REG_ERR = 1606       # 3 registers, byte-packed -> 6 values
 REG_STATUS = 1612    # 3 registers, byte-packed -> 6 values
 REG_TEMPERATURE = 1618  # 3 registers, byte-packed -> 6 values
 
+# Tactile sensor registers (Inspire PDF §2.6.20).
+# The full tactile block lives at byte addresses 3000-5123 inclusive.
+# Each Modbus holding register holds 2 bytes, and every touch point is a
+# little-endian uint16 spanning 2 bytes, so the register count equals the
+# touch-point count (1062).
+REG_TACTILE_START = 3000
+REG_TACTILE_END = 5123  # inclusive last byte
+TACTILE_TOTAL_REGS = (REG_TACTILE_END - REG_TACTILE_START + 1) // 2  # 1062
+MODBUS_MAX_REGS = 120  # safe margin under the 125-register Modbus limit
+
+# Tactile skin region layout: (region_name, start_byte, n_points, (rows, cols)).
+# Byte addresses are offsets from REG_TACTILE_START; every region is a
+# contiguous block of little-endian uint16 touch values in the tactile buffer.
+TACTILE_LAYOUT = [
+    ("little_tip",     3000,   9, (3, 3)),
+    ("little_nail",    3018,  96, (12, 8)),
+    ("little_pad",     3210,  80, (10, 8)),
+    ("ring_tip",       3370,   9, (3, 3)),
+    ("ring_nail",      3388,  96, (12, 8)),
+    ("ring_pad",       3580,  80, (10, 8)),
+    ("middle_tip",     3740,   9, (3, 3)),
+    ("middle_nail",    3758,  96, (12, 8)),
+    ("middle_pad",     3950,  80, (10, 8)),
+    ("index_tip",      4110,   9, (3, 3)),
+    ("index_nail",     4128,  96, (12, 8)),
+    ("index_pad",      4320,  80, (10, 8)),
+    ("thumb_tip",      4480,   9, (3, 3)),
+    ("thumb_nail",     4498,  96, (12, 8)),
+    ("thumb_middle",   4690,   9, (3, 3)),
+    ("thumb_pad",      4708,  96, (12, 8)),
+    ("palm",           4900, 112, (8, 14)),
+]
+
+
+def slice_tactile(flat_buf):
+    """Reshape a flat 1062-element tactile buffer into named region arrays.
+
+    Args:
+        flat_buf: 1-D array of length TACTILE_TOTAL_REGS (dtype uint16).
+
+    Returns:
+        Dict mapping region name to a 2-D array of the shape given in
+        TACTILE_LAYOUT. Each region is a view into `flat_buf`.
+    """
+    out = {}
+    for name, start_byte, n_points, shape in TACTILE_LAYOUT:
+        offset = (start_byte - REG_TACTILE_START) // 2
+        region = flat_buf[offset:offset + n_points]
+        out[name] = region.reshape(shape)
+    return out
+
+
 DEFAULT_QPOS_LEFT = DEFAULT_HAND_POSE["unitree_g1_inspire"]["left"]["open"]
 DEFAULT_QPOS_RIGHT = DEFAULT_HAND_POSE["unitree_g1_inspire"]["right"]["open"]
 
@@ -128,6 +180,12 @@ class InspireHandController:
         self.Rtemp = np.zeros(Inspire_Num_Motors, dtype=np.float32)
         self.Ltau = np.zeros(Inspire_Num_Motors, dtype=np.float32)
         self.Rtau = np.zeros(Inspire_Num_Motors, dtype=np.float32)
+
+        # Tactile buffers: flat uint16 arrays of length TACTILE_TOTAL_REGS
+        # per hand. Use slice_tactile() to reshape into named skin regions.
+        # Populated by the per-hand worker thread each tick.
+        self.Ltactile = np.zeros(TACTILE_TOTAL_REGS, dtype=np.uint16)
+        self.Rtactile = np.zeros(TACTILE_TOTAL_REGS, dtype=np.uint16)
 
         # --- threading primitives ---
         # Two independent locks: _cmd_lock protects the command buffer,
@@ -224,6 +282,41 @@ class InspireHandController:
         except Exception as e:
             print(f"Exception reading byte registers at {address}: {e}")
             return [0] * (count * 2)
+
+    def _read_tactile(self, client, prev_buf):
+        """Read the full tactile sensor block from one hand.
+
+        Reads TACTILE_TOTAL_REGS (1062) holding registers in chunks of
+        MODBUS_MAX_REGS (stays under the pymodbus 125-register cap),
+        decodes each register as two bytes (high, low), and reinterprets
+        the byte stream as little-endian uint16 touch values per the
+        Inspire PDF §2.6.20.
+
+        On any transient Modbus error the previously cached buffer is
+        returned, so consumers never observe momentary zero-glitches
+        mid-episode. No print/log is emitted here because the worker
+        calls this at ~20 Hz — any chatty error would spam. The worker's
+        `_note_error` path still fires via the enclosing try/except.
+        """
+        try:
+            byte_buf = bytearray(TACTILE_TOTAL_REGS * 2)
+            n_remaining = TACTILE_TOTAL_REGS
+            reg_addr = REG_TACTILE_START
+            byte_offset = 0
+            while n_remaining > 0:
+                chunk = min(MODBUS_MAX_REGS, n_remaining)
+                response = self._read_holding(client, reg_addr, chunk)
+                if response.isError():
+                    return prev_buf
+                for reg in response.registers:
+                    byte_buf[byte_offset] = (reg >> 8) & 0xFF
+                    byte_buf[byte_offset + 1] = reg & 0xFF
+                    byte_offset += 2
+                reg_addr += chunk
+                n_remaining -= chunk
+            return np.frombuffer(bytes(byte_buf), dtype='<u2').copy()
+        except Exception:
+            return prev_buf
 
     def _bootstrap_read_sync(self):
         """One-shot synchronous read of angle/current/temperature for both hands.
@@ -366,8 +459,23 @@ class InspireHandController:
                 except Exception as e:
                     self._note_error(side, f"read temperature: {e}")
 
+                # --- 2d. Read tactile (dense 1062-uint16 block) ---
+                # This read dominates the per-tick budget (~40 ms on the
+                # 192.168.123.x LAN vs ~3 ms for the other reads), so the
+                # worker effectively runs at ~19 Hz per hand under the
+                # overrun-reset branch below. That is intentional; the
+                # main 50 Hz control loop is unaffected because it reads
+                # the cache, not the hardware.
+                tactile = None
+                try:
+                    prev = self.Ltactile if is_left else self.Rtactile
+                    tactile = self._read_tactile(client, prev)
+                except Exception as e:
+                    self._note_error(side, f"read tactile: {e}")
+
                 # --- 3. Commit cache under _state_lock ---
-                if pos is not None or tau is not None or temp is not None:
+                if (pos is not None or tau is not None
+                        or temp is not None or tactile is not None):
                     with self._state_lock:
                         if is_left:
                             if pos is not None:
@@ -377,6 +485,8 @@ class InspireHandController:
                                 self.Ltau = tau
                             if temp is not None:
                                 self.Ltemp = temp
+                            if tactile is not None:
+                                self.Ltactile = tactile
                         else:
                             if pos is not None:
                                 self.Rpos = pos
@@ -385,6 +495,8 @@ class InspireHandController:
                                 self.Rtau = tau
                             if temp is not None:
                                 self.Rtemp = temp
+                            if tactile is not None:
+                                self.Rtactile = tactile
 
             except Exception as e:
                 # Catch-all: a bug in worker code must never silently kill
@@ -416,12 +528,15 @@ class InspireHandController:
         """Return a snapshot of all cached hand telemetry (non-blocking).
 
         Returns:
-            (Lpos, Rpos, Ltemp, Rtemp, Ltau, Rtau): float32 arrays, shape (6,) each.
+            (Lpos, Rpos, Ltemp, Rtemp, Ltau, Rtau, Ltactile, Rtactile):
+                - Lpos/Rpos/Ltemp/Rtemp/Ltau/Rtau: float32 arrays, shape (6,) each.
+                - Ltactile/Rtactile: uint16 arrays, shape (TACTILE_TOTAL_REGS,) each.
         """
         with self._state_lock:
             return (self.Lpos.copy(), self.Rpos.copy(),
                     self.Ltemp.copy(), self.Rtemp.copy(),
-                    self.Ltau.copy(), self.Rtau.copy())
+                    self.Ltau.copy(), self.Rtau.copy(),
+                    self.Ltactile.copy(), self.Rtactile.copy())
 
     def _coerce_shape(self, arr):
         """Fit a 1-D array to Inspire_Num_Motors by truncating or zero-padding.

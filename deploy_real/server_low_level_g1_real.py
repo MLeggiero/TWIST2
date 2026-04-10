@@ -255,13 +255,29 @@ class RealTimePolicyController(object):
                 
                 if self.use_hand:
                     left_hand_state, right_hand_state = self.hand_ctrl.get_hand_state()
-                    lh_pos, rh_pos, lh_temp, rh_temp, lh_tau, rh_tau = self.hand_ctrl.get_hand_all_state()
                     hand_left_json = json.dumps(left_hand_state.tolist())
                     hand_right_json = json.dumps(right_hand_state.tolist())
                     self.redis_pipeline.set("state_hand_left_unitree_g1_with_hands", hand_left_json)
                     self.redis_pipeline.set("state_hand_right_unitree_g1_with_hands", hand_right_json)
+
+                    # One consistent snapshot of all hand telemetry. The
+                    # Inspire wrapper returns an 8-tuple (with tactile);
+                    # the dex3 wrapper returns a 6-tuple (no tactile).
+                    all_state = self.hand_ctrl.get_hand_all_state()
+                    lh_pos, rh_pos, lh_temp, rh_temp, lh_tau, rh_tau = all_state[:6]
                     self.redis_pipeline.set("force_hand_left_unitree_g1_with_hands", json.dumps(lh_tau.tolist()))
                     self.redis_pipeline.set("force_hand_right_unitree_g1_with_hands", json.dumps(rh_tau.tolist()))
+
+                    # Dense tactile, Inspire-only. Duck-type on the
+                    # attribute so the dex3 path never touches these keys.
+                    if hasattr(self.hand_ctrl, "Ltactile") and len(all_state) >= 8:
+                        lh_tactile, rh_tactile = all_state[6], all_state[7]
+                        self.redis_pipeline.set(
+                            "tactile_hand_left_unitree_g1_with_hands",
+                            json.dumps(lh_tactile.tolist()))
+                        self.redis_pipeline.set(
+                            "tactile_hand_right_unitree_g1_with_hands",
+                            json.dumps(rh_tactile.tolist()))
                 
                 self.redis_pipeline.set("action_low_level_unitree_g1_with_hands", json.dumps(self.last_target_dof_pos.tolist()))
                 # execute the pipeline once here for setting the keys
