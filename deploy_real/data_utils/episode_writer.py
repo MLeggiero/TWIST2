@@ -9,6 +9,15 @@ from queue import Queue, Empty
 from threading import Thread
 from rich import print
 
+from data_utils.g1_schema import (
+    STATE_BODY_DIM,
+    ACTION_BODY_DIM,
+    reorder_state_body,
+    reorder_action_body,
+    build_modality_json,
+    build_schema_block,
+)
+
 class EpisodeWriter():
     def __init__(self, task_dir, frequency=30,
                  image_shape=(480, 640, 3),
@@ -38,6 +47,7 @@ class EpisodeWriter():
             print(f"==> episode directory does not exist, now create one.\n")
         self.data_info()
         self.text_desc()
+        self._write_modality_json()
 
         self.is_available = True  # Indicates whether the class is available for new operations
         # Initialize the queue and worker thread
@@ -57,7 +67,7 @@ class EpisodeWriter():
                 "image": {"width":self.image_shape[0], "height":self.image_shape[1], "fps":self.frequency},
             }
         
-    def text_desc(self, goal="pick up the red cup on the table.", 
+    def text_desc(self, goal="pick up the red cup on the table.",
                   desc="Pick up the cup from the table and place it in another position. The operation should be smooth and the water in the cup should not spill out",
                   steps="step1: searching for cups. step2: go to the target location. step3: pick up the cup"):
         self.text = {
@@ -65,7 +75,23 @@ class EpisodeWriter():
             "desc": desc,
             "steps":steps,
         }
- 
+
+    def _write_modality_json(self):
+        """Write `<task>/meta/modality.json` (LeRobot / Isaac-GR00T format).
+
+        The file is idempotent: it describes the dataset schema, not the
+        episodes, so the same file is overwritten every run.
+        """
+        try:
+            meta_dir = os.path.join(self.task_dir, "meta")
+            os.makedirs(meta_dir, exist_ok=True)
+            modality_path = os.path.join(meta_dir, "modality.json")
+            with open(modality_path, "w", encoding="utf-8") as f:
+                json.dump(build_modality_json(), f, indent=4, ensure_ascii=False)
+            print(f"==> wrote modality.json -> {modality_path}")
+        except Exception as e:
+            print(f"==> Warning: failed to write modality.json ({e})")
+
     def create_episode(self):
         """
         Create a new episode.
@@ -180,8 +206,17 @@ class EpisodeWriter():
             np.save(save_path, pointcloud.astype(np.float32))
             item_data['pointcloud'] = str(Path(save_path).relative_to(Path(self.json_path).parent))
 
-        # state and action are directly saved to the episode_data
+        # state and action are directly saved to the episode_data.
+        # state_body/action_body get reordered to the labelled (joints-first)
+        # layout per g1_schema, guarded by length checks so episodes that
+        # pre-date the schema port still save cleanly.
         if state_body is not None:
+            try:
+                if len(state_body) == STATE_BODY_DIM:
+                    state_body = reorder_state_body(state_body)
+            except Exception as e:
+                print(f"==> Warning: state_body reorder failed ({e}); "
+                      f"saving raw vector.")
             item_data['state_body'] = state_body
         if state_hand_left is not None:
             item_data['state_hand_left'] = state_hand_left
@@ -189,6 +224,12 @@ class EpisodeWriter():
             item_data['state_hand_right'] = state_hand_right
 
         if action_body is not None:
+            try:
+                if len(action_body) == ACTION_BODY_DIM:
+                    action_body = reorder_action_body(action_body)
+            except Exception as e:
+                print(f"==> Warning: action_body reorder failed ({e}); "
+                      f"saving raw vector.")
             item_data['action_body'] = action_body
         if action_hand_left is not None:
             item_data['action_hand_left'] = action_hand_left
@@ -202,13 +243,21 @@ class EpisodeWriter():
         if action_low_level is not None:
             item_data['action_low_level'] = action_low_level
 
-        # hand force/current (tactile proxy)
+        # hand force/current (motor-current proxy for effort)
         force_hand_left = item_data.get('force_hand_left', None)
         force_hand_right = item_data.get('force_hand_right', None)
         if force_hand_left is not None:
             item_data['force_hand_left'] = force_hand_left
         if force_hand_right is not None:
             item_data['force_hand_right'] = force_hand_right
+
+        # dense Inspire tactile (1062 uint16 points per hand)
+        tactile_hand_left = item_data.get('tactile_hand_left', None)
+        tactile_hand_right = item_data.get('tactile_hand_right', None)
+        if tactile_hand_left is not None:
+            item_data['tactile_hand_left'] = tactile_hand_left
+        if tactile_hand_right is not None:
+            item_data['tactile_hand_right'] = tactile_hand_right
 
         # Save item_data to episode_data
         # Update episode data
@@ -232,6 +281,13 @@ class EpisodeWriter():
         self.data['info'] = self.info
         self.data['text'] = self.text
         self.data['label'] = self.label
+        # Inline self-describing schema so downstream readers don't have
+        # to consult any other file to interpret the flat state/action
+        # vectors (see data_utils/g1_schema.build_schema_block).
+        try:
+            self.data['schema'] = build_schema_block()
+        except Exception as e:
+            print(f"==> Warning: failed to attach schema block ({e})")
         self.data['data'] = self.episode_data
         with open(self.json_path, 'w', encoding='utf-8') as jsonf:
             jsonf.write(json.dumps(self.data, indent=4, ensure_ascii=False))

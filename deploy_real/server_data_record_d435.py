@@ -193,6 +193,8 @@ def main(args):
                     "action_low_level_unitree_g1_with_hands",
                     "force_hand_left_unitree_g1_with_hands",
                     "force_hand_right_unitree_g1_with_hands",
+                    "tactile_hand_left_unitree_g1_with_hands",
+                    "tactile_hand_right_unitree_g1_with_hands",
                 ]
 
                 data_dict_keys = [
@@ -209,6 +211,8 @@ def main(args):
                     "action_low_level",
                     "force_hand_left",
                     "force_hand_right",
+                    "tactile_hand_left",
+                    "tactile_hand_right",
                 ]
 
                 try:

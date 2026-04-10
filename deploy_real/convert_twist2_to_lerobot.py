@@ -42,6 +42,7 @@ DIM_ACTION_LOW_LEVEL = 29  # low-level motor commands
 
 HAND_DIM = {'dex3': 7, 'inspire': 6}
 DIM_FORCE_HAND = {'dex3': 7, 'inspire': 6}  # motor current per finger
+DIM_TACTILE = 1062  # Inspire RH56DFTP: 1062 uint16 touch points per hand
 
 
 def parse_args():
@@ -79,6 +80,11 @@ def parse_args():
                         help="Hand type: dex3 (7-DOF) or inspire (6-DOF). Must match what was used during recording.")
     parser.add_argument("--include_force", action="store_true", default=False,
                         help="Include hand force/current data as observation.force (requires force-enabled recordings)")
+    parser.add_argument("--include_tactile", type=str, default="auto",
+                        choices=["auto", "on", "off"],
+                        help="Include Inspire tactile arrays as observation.tactile.{left,right} "
+                             "(auto: detect from first frame + hand_type=='inspire'; "
+                             "on: force include; off: force exclude)")
     parser.add_argument("--skip_unsuccessful", action="store_true", default=False,
                         help="Skip episodes whose label contains 'unsuccessful'")
 
@@ -152,6 +158,31 @@ def build_force(frame: dict, idx: int, hand_dof: int) -> np.ndarray:
     return np.concatenate([force_left, force_right])
 
 
+def build_tactile(frame: dict, idx: int, side: str, hand_type: str) -> np.ndarray:
+    """Build a single-side tactile observation vector.
+
+    Returns a zero vector if the hand type is not inspire or if the
+    frame lacks the tactile field (e.g. pre-port episodes). Casts to
+    int32 because parquet prefers signed integer types and the tactile
+    values fit comfortably in 16 bits.
+    """
+    if hand_type != "inspire":
+        return np.zeros(DIM_TACTILE, dtype=np.int32)
+    value = frame.get(f"tactile_hand_{side}")
+    if value is None:
+        warnings.warn(
+            f"Frame {idx}: 'tactile_hand_{side}' is None, zero-filling "
+            f"({DIM_TACTILE}d)")
+        return np.zeros(DIM_TACTILE, dtype=np.int32)
+    arr = np.asarray(value, dtype=np.int32)
+    if arr.shape[0] != DIM_TACTILE:
+        warnings.warn(
+            f"Frame {idx}: 'tactile_hand_{side}' has dim {arr.shape[0]}, "
+            f"expected {DIM_TACTILE}. Zero-filling.")
+        return np.zeros(DIM_TACTILE, dtype=np.int32)
+    return arr
+
+
 def main():
     args = parse_args()
 
@@ -202,6 +233,19 @@ def main():
     height, width = first_img.shape[:2]
     print(f"Image dimensions: {height}x{width}")
 
+    # Resolve --include_tactile. "auto" means: enable iff hand_type is
+    # inspire AND the first frame has a tactile_hand_left field.
+    first_frame = first_data["data"][0]
+    if args.include_tactile == "auto":
+        include_tactile = (
+            args.hand_type == "inspire"
+            and first_frame.get("tactile_hand_left") is not None
+        )
+    elif args.include_tactile == "on":
+        include_tactile = True
+    else:
+        include_tactile = False
+
     # Compute action dim
     action_dim = get_action_dim(args.action_mode, args.include_hand, hand_dof)
     dim_force = hand_dof * 2  # left + right
@@ -209,6 +253,8 @@ def main():
     print(f"State dim: {dim_state}")
     if args.include_force:
         print(f"Force dim: {dim_force} (motor current, {hand_dof} per hand)")
+    if include_tactile:
+        print(f"Tactile dim: {DIM_TACTILE} per hand (int32)")
 
     # Define features
     vision_dtype = "video" if args.use_videos else "image"
@@ -235,6 +281,18 @@ def main():
             "dtype": "float32",
             "shape": (dim_force,),
             "names": ["force"],
+        }
+
+    if include_tactile:
+        features["observation.tactile.left"] = {
+            "dtype": "int32",
+            "shape": (DIM_TACTILE,),
+            "names": ["tactile_left"],
+        }
+        features["observation.tactile.right"] = {
+            "dtype": "int32",
+            "shape": (DIM_TACTILE,),
+            "names": ["tactile_right"],
         }
 
     # Create dataset
@@ -291,6 +349,11 @@ def main():
 
             if args.include_force:
                 frame_data["observation.force"] = build_force(frame, idx, hand_dof)
+            if include_tactile:
+                frame_data["observation.tactile.left"] = build_tactile(
+                    frame, idx, "left", args.hand_type)
+                frame_data["observation.tactile.right"] = build_tactile(
+                    frame, idx, "right", args.hand_type)
             dataset.add_frame(frame_data)
 
         dataset.save_episode()
@@ -316,6 +379,7 @@ def main():
     print(f"  Action mode: {args.action_mode}")
     print(f"  Include hand: {args.include_hand}")
     print(f"  Include force: {args.include_force}")
+    print(f"  Include tactile: {include_tactile}")
     print(f"  Output:     {output_dir}")
     print("=" * 60)
 
