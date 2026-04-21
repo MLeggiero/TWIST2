@@ -16,6 +16,7 @@ Differences from server_data_record.py (ZED):
 import argparse
 import json
 import os
+import sys
 import time
 
 import cv2
@@ -111,29 +112,56 @@ def main(args):
     print(f"Recorded control frequency: {args.frequency} Hz (subsample every {subsample_interval} frames)")
 
     speaker = Speaker()
-    prev_button_pressed = False
-    prev_right_axis_click_pressed = False
+
+    # Keyboard-driven recording control (PICO controllers are not used).
+    # 'y' toggles recording (saves as successful on stop).
+    # 'u' saves the current episode as unsuccessful.
+    # 'q' quits the recording loop cleanly.
+    kbd_state = {"toggle": False, "mark_unsuccessful": False, "quit": False}
+    kbd_lock = threading.Lock()
+
+    def keyboard_loop():
+        print("\n" + "=" * 50)
+        print("KEYBOARD CONTROL ACTIVE (data recording)")
+        print("  [y] Start / stop recording (save as successful on stop)")
+        print("  [u] Save current episode as UNSUCCESSFUL")
+        print("  [q] Quit")
+        print("=" * 50 + "\n")
+        while True:
+            try:
+                cmd = input().strip().lower()
+            except EOFError:
+                return
+            with kbd_lock:
+                if cmd == 'y':
+                    kbd_state["toggle"] = True
+                elif cmd == 'u':
+                    kbd_state["mark_unsuccessful"] = True
+                elif cmd == 'q':
+                    kbd_state["quit"] = True
+                    return
+
+    threading.Thread(target=keyboard_loop, name="KbdRec", daemon=True).start()
 
     try:
         while running:
             start_time = time.time()
 
-            # ---- Controller input ----
-            controller_data = json.loads(redis_client.get("controller_data"))
-            button_pressed = controller_data["LeftController"]["key_two"]
+            # ---- Pull keyboard events ----
+            with kbd_lock:
+                toggle = kbd_state["toggle"]
+                mark_unsuccessful = kbd_state["mark_unsuccessful"]
+                quit_requested = kbd_state["quit"]
+                kbd_state["toggle"] = False
+                kbd_state["mark_unsuccessful"] = False
 
-            quit_key = controller_data["LeftController"]["axis_click"]
-            if quit_key:
+            if quit_requested:
                 running = False
                 speaker.speak("Recording stopped.")
                 print("\nQuitting...")
                 break
 
-            right_axis_click = controller_data["RightController"]["axis_click"]
-
-            # Rising-edge toggle
-            if button_pressed and not prev_button_pressed:
-                print("button pressed")
+            if toggle:
                 recording = not recording
                 if recording:
                     speaker.speak("episode recording started.")
@@ -146,14 +174,10 @@ def main(args):
                     recorder.save_episode(label="successful")
                     speaker.speak("episode saved as successful.")
 
-            # Right axis_click: save as unsuccessful
-            if right_axis_click and not prev_right_axis_click_pressed and recording:
+            if mark_unsuccessful and recording:
                 recorder.save_episode(label="unsuccessful")
                 recording = False
                 speaker.speak("episode saved as unsuccessful.")
-
-            prev_button_pressed = button_pressed
-            prev_right_axis_click_pressed = right_axis_click
 
             if recording:
                 frame_counter += 1

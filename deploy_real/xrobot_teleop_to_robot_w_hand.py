@@ -35,7 +35,7 @@ import mujoco as mj
 import mujoco.viewer as mjv
 import numpy as np
 import redis
-from data_utils.finger_tracking import PicoFingerTracker
+from data_utils.dex_finger_tracker import DualDexFingerTracker
 from data_utils.fps_monitor import FPSMonitor
 from data_utils.params import DEFAULT_HAND_POSE, DEFAULT_MIMIC_OBS
 from data_utils.rot_utils import euler_from_quaternion_np, quat_diff_np, quat_rotate_inverse_np
@@ -115,9 +115,14 @@ class StateMachine:
         """
         State process for teleoperation:
         idle -> teleop -> pause -> teleop ... -> idle -> exit
+
+        With --finger_tracking the publisher runs continuously in "teleop"
+        state (no idle gate). Whether the robot actually *follows* the stream
+        is decided by sim2real's teleop_enabled latch, not by this process.
         """
-        self.state = "idle"
-        self.previous_state = "idle"
+        initial_state = "teleop" if use_finger_tracking else "idle"
+        self.state = initial_state
+        self.previous_state = initial_state
         self.right_key_one_was_pressed = False
         self.left_key_one_was_pressed = False
         self.left_axis_click_was_pressed = False
@@ -153,11 +158,7 @@ class StateMachine:
         # Finger tracking
         self.use_finger_tracking = use_finger_tracking
         if use_finger_tracking:
-            self.finger_tracker = PicoFingerTracker(
-                smoothing_alpha=0.3,
-                curl_gain=1.5,
-                curl_deadzone=0.05
-            )
+            self.finger_tracker = DualDexFingerTracker()
             # Tracked finger poses (6-DOF Inspire angles per hand)
             self._tracked_left_hand_pose = None
             self._tracked_right_hand_pose = None
@@ -211,7 +212,11 @@ class StateMachine:
                 self.state = "teleop"
 
         # Handle hand control
-        if self.hand_type == 'inspire':
+        # Finger tracking mode bypasses controller-driven hand control entirely —
+        # hand commands come from DualDexFingerTracker in update_hand_from_tracking().
+        if self.use_finger_tracking:
+            pass
+        elif self.hand_type == 'inspire':
             # Inspire: proportional analog control
             # Trigger (index_trig) = 4 fingers
             # Each joystick controls its respective hand's thumb:
@@ -579,6 +584,20 @@ class XRobotTeleopToRobot:
         if self.teleop_data_streamer is not None:
             return self.teleop_data_streamer.get_current_frame()
         return None, None, None, None, None
+
+    @staticmethod
+    def _unpack_hand_frame(hand_frame):
+        """Normalize XRobotStreamer hand output to (is_active, dict_or_None).
+
+        `get_current_frame` returns each side as ``(bool, dict)``. Older
+        downstream code sometimes received just the dict, so accept either.
+        """
+        if hand_frame is None:
+            return False, None
+        if isinstance(hand_frame, tuple) and len(hand_frame) == 2:
+            is_active, data = hand_frame
+            return bool(is_active), data
+        return True, hand_frame
         
     def process_retargeting(self, smplx_data):
         """Process motion retargeting and return observations"""
@@ -812,62 +831,49 @@ class XRobotTeleopToRobot:
 
 
     def _start_keyboard_control_thread(self):
-        """Start a daemon thread that reads keyboard input for state machine control.
-        
-        Used when finger tracking is enabled and a separate operator
-        controls start/pause/exit via keyboard.
-        
+        """Start a daemon thread that reads keyboard input for teleop control.
+
+        Used when finger tracking is enabled. The state machine stays in
+        "teleop" for the entire session; this thread only handles clean
+        exit and emergency stop. sim2real's keyboard [a] / G1 [A] gates
+        whether the robot actually follows the stream.
+
         Keyboard commands:
-          s / Enter : Cycle state (idle -> teleop -> pause -> teleop ...)
-          q         : Exit program
-          e         : Emergency stop
+          q : Exit program
+          e : Emergency stop (kill sim2real process)
         """
         import threading
-        
+
         def keyboard_loop():
             print("\n" + "=" * 50)
             print("KEYBOARD CONTROL ACTIVE (finger tracking mode)")
-            print("  [s] or [Enter] : Start / Pause / Resume teleop")
-            print("  [q]            : Exit program")
-            print("  [e]            : Emergency stop")
+            print("  [q] : Exit program")
+            print("  [e] : Emergency stop (kill sim2real)")
+            print("  (Teleop feedthrough is gated on sim2real side — keyboard [a])")
             print("=" * 50 + "\n")
-            
+
             while True:
                 try:
                     cmd = input().strip().lower()
-                    if cmd in ('s', ''):
-                        self._keyboard_command = 'cycle'
-                    elif cmd == 'q':
+                    if cmd == 'q':
                         self._keyboard_command = 'exit'
                     elif cmd == 'e':
                         self._keyboard_command = 'emergency'
                 except EOFError:
                     break
-        
+
         self._keyboard_thread = threading.Thread(target=keyboard_loop, daemon=True)
         self._keyboard_thread.start()
-    
+
     def _process_keyboard_commands(self):
-        """Process any pending keyboard commands for state machine control."""
+        """Process any pending keyboard commands."""
         cmd = self._keyboard_command
         if cmd is None:
             return
-        
+
         self._keyboard_command = None
-        
-        if cmd == 'cycle':
-            # Mimic right_key_one press: idle -> teleop -> pause -> teleop
-            self.state_machine.previous_state = self.state_machine.state
-            if self.state_machine.state == "idle":
-                self.state_machine.state = "teleop"
-                print("[Keyboard] State: idle -> teleop")
-            elif self.state_machine.state == "teleop":
-                self.state_machine.state = "pause"
-                print("[Keyboard] State: teleop -> pause")
-            elif self.state_machine.state == "pause":
-                self.state_machine.state = "teleop"
-                print("[Keyboard] State: pause -> teleop")
-        elif cmd == 'exit':
+
+        if cmd == 'exit':
             self.state_machine.previous_state = self.state_machine.state
             self.state_machine.state = "exit"
             print("[Keyboard] Exit requested")
@@ -887,7 +893,8 @@ class XRobotTeleopToRobot:
         print("Teleop state machine initialized. Controls:")
         if self.use_finger_tracking:
             print("- FINGER TRACKING MODE: Hand poses from Pico hand tracking")
-            print("- Keyboard control by separate operator (see terminal prompts)")
+            print("- Publishing teleop obs continuously (no idle gate).")
+            print("  Feedthrough to the robot is gated on sim2real (keyboard [a] / G1 [A]).")
         else:
             print("- Right controller key_one: Cycle through idle -> teleop -> pause -> teleop...")
             print("- Left controller key_one: Exit program")
@@ -939,9 +946,21 @@ class XRobotTeleopToRobot:
                     self.state_machine.update(controller_data)
                     self.send_controller_data_to_redis(controller_data)
                 
-                # Update hand poses from finger tracking
+                # Update hand poses from finger tracking.
+                # XRobotStreamer.get_current_frame returns hand data as
+                # (is_active, joint_dict). Unpack before handing to the tracker
+                # and skip sides that aren't currently active.
                 if self.use_finger_tracking and self.state_machine.is_teleop_active():
-                    self.state_machine.update_hand_from_tracking(left_hand_data, right_hand_data)
+                    left_active, left_dict = self._unpack_hand_frame(left_hand_data)
+                    right_active, right_dict = self._unpack_hand_frame(right_hand_data)
+                    try:
+                        self.state_machine.update_hand_from_tracking(
+                            left_dict if left_active else None,
+                            right_dict if right_active else None,
+                        )
+                    except Exception as e:
+                        # Keep teleop alive; sim2real still gates robot output.
+                        print(f"[finger tracking] skipped frame: {e}")
                 
                 # Check if we should exit
                 if self.state_machine.should_exit():

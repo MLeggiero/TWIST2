@@ -129,7 +129,7 @@ DEFAULT_QPOS_RIGHT = DEFAULT_HAND_POSE["unitree_g1_inspire"]["right"]["open"]
 
 class InspireHandController:
     def __init__(self, left_ip='192.168.123.210', right_ip='192.168.123.211',
-                 port=6000, device_id=1, re_init=True):
+                 port=6000, device_id=1, re_init=True, active_hand='both'):
         """
         Initialize Inspire hand controller via Modbus TCP.
 
@@ -145,31 +145,48 @@ class InspireHandController:
             port: Modbus TCP port (default 6000)
             device_id: Modbus device ID (default 1)
             re_init: Whether to clear errors and move to default position
+            active_hand: 'both' | 'left' | 'right'. If single-side, the
+                disabled side is never connected and all its Modbus I/O
+                is skipped; its cached state stays zero. Use this when
+                one hand is physically broken/unplugged.
         """
-        print("Initialize InspireHandController...")
-        print(f"  Left hand IP: {left_ip}:{port}")
-        print(f"  Right hand IP: {right_ip}:{port}")
+        if active_hand not in ('both', 'left', 'right'):
+            raise ValueError(
+                f"active_hand must be 'both', 'left', or 'right', got {active_hand}")
+        self.active_hand = active_hand
+        self.left_active = active_hand in ('both', 'left')
+        self.right_active = active_hand in ('both', 'right')
+
+        print(f"Initialize InspireHandController (active_hand={active_hand})...")
+        if self.left_active:
+            print(f"  Left hand IP: {left_ip}:{port}")
+        if self.right_active:
+            print(f"  Right hand IP: {right_ip}:{port}")
 
         self.device_id = device_id
         self._dev_kwargs = {_DEVICE_ID_KEY: device_id} if _DEVICE_ID_KEY else {}
 
-        self.left_client = ModbusTcpClient(left_ip, port=port)
-        self.right_client = ModbusTcpClient(right_ip, port=port)
+        self.left_client = ModbusTcpClient(left_ip, port=port) if self.left_active else None
+        self.right_client = ModbusTcpClient(right_ip, port=port) if self.right_active else None
 
-        if not self.left_client.connect():
-            raise ConnectionError(
-                f"Failed to connect to left Inspire hand at {left_ip}:{port}")
-        print(f"  Left hand connected")
+        if self.left_active:
+            if not self.left_client.connect():
+                raise ConnectionError(
+                    f"Failed to connect to left Inspire hand at {left_ip}:{port}")
+            print(f"  Left hand connected")
 
-        if not self.right_client.connect():
-            raise ConnectionError(
-                f"Failed to connect to right Inspire hand at {right_ip}:{port}")
-        print(f"  Right hand connected")
+        if self.right_active:
+            if not self.right_client.connect():
+                raise ConnectionError(
+                    f"Failed to connect to right Inspire hand at {right_ip}:{port}")
+            print(f"  Right hand connected")
 
         # Clear errors on init
         if re_init:
-            self.left_client.write_register(REG_CLEAR_ERROR, 1, **self._dev_kwargs)
-            self.right_client.write_register(REG_CLEAR_ERROR, 1, **self._dev_kwargs)
+            if self.left_active:
+                self.left_client.write_register(REG_CLEAR_ERROR, 1, **self._dev_kwargs)
+            if self.right_active:
+                self.right_client.write_register(REG_CLEAR_ERROR, 1, **self._dev_kwargs)
 
         # State arrays (updated by worker threads under _state_lock)
         self.left_hand_state_array = np.zeros(Inspire_Num_Motors, dtype=np.float32)
@@ -218,8 +235,10 @@ class InspireHandController:
         # so that consumers never see zeroed caches and TCP failures raise
         # from __init__ as they do today.
         self._bootstrap_read_sync()
-        print(f"  Left hand state: {self.left_hand_state_array}")
-        print(f"  Right hand state: {self.right_hand_state_array}")
+        if self.left_active:
+            print(f"  Left hand state: {self.left_hand_state_array}")
+        if self.right_active:
+            print(f"  Right hand state: {self.right_hand_state_array}")
 
         if re_init:
             self._bootstrap_write_default_sync()
@@ -228,20 +247,22 @@ class InspireHandController:
         # exclusively — this avoids any need for a per-client mutex and
         # lets L and R hand I/O run truly in parallel (separate sockets,
         # separate IPs, GIL released during socket.recv).
-        self._worker_left = threading.Thread(
-            target=self._worker_loop,
-            args=("left", self.left_client),
-            name="InspireHandWorker-L",
-            daemon=True,
-        )
-        self._worker_right = threading.Thread(
-            target=self._worker_loop,
-            args=("right", self.right_client),
-            name="InspireHandWorker-R",
-            daemon=True,
-        )
-        self._worker_left.start()
-        self._worker_right.start()
+        if self.left_active:
+            self._worker_left = threading.Thread(
+                target=self._worker_loop,
+                args=("left", self.left_client),
+                name="InspireHandWorker-L",
+                daemon=True,
+            )
+            self._worker_left.start()
+        if self.right_active:
+            self._worker_right = threading.Thread(
+                target=self._worker_loop,
+                args=("right", self.right_client),
+                name="InspireHandWorker-R",
+                daemon=True,
+            )
+            self._worker_right.start()
 
         print("Initialize InspireHandController OK!\n")
 
@@ -319,43 +340,44 @@ class InspireHandController:
             return prev_buf
 
     def _bootstrap_read_sync(self):
-        """One-shot synchronous read of angle/current/temperature for both hands.
+        """One-shot synchronous read of angle/current/temperature for active hands.
 
         Used only during __init__ before worker threads exist. Populates the
         feedback cache fields directly (no lock needed — no concurrent readers
-        yet). If TCP is broken, the underlying read helpers return zeros and
-        log an error, matching the legacy behavior.
+        yet). Disabled sides keep their zero-initialized caches.
         """
-        left_angles = self._read_registers_signed(self.left_client, REG_ANGLE_ACT, 6)
-        right_angles = self._read_registers_signed(self.right_client, REG_ANGLE_ACT, 6)
+        if self.left_active:
+            left_angles = self._read_registers_signed(self.left_client, REG_ANGLE_ACT, 6)
+            self.left_hand_state_array = np.array(left_angles, dtype=np.float32)
+            self.Lpos = self.left_hand_state_array.copy()
+            left_current = self._read_registers_signed(self.left_client, REG_CURRENT, 6)
+            self.Ltau = np.array(left_current, dtype=np.float32)
+            left_temp = self._read_registers_bytes(self.left_client, REG_TEMPERATURE, 3)
+            self.Ltemp = np.array(left_temp[:Inspire_Num_Motors], dtype=np.float32)
 
-        self.left_hand_state_array = np.array(left_angles, dtype=np.float32)
-        self.right_hand_state_array = np.array(right_angles, dtype=np.float32)
-        self.Lpos = self.left_hand_state_array.copy()
-        self.Rpos = self.right_hand_state_array.copy()
-
-        left_current = self._read_registers_signed(self.left_client, REG_CURRENT, 6)
-        right_current = self._read_registers_signed(self.right_client, REG_CURRENT, 6)
-        self.Ltau = np.array(left_current, dtype=np.float32)
-        self.Rtau = np.array(right_current, dtype=np.float32)
-
-        left_temp = self._read_registers_bytes(self.left_client, REG_TEMPERATURE, 3)
-        right_temp = self._read_registers_bytes(self.right_client, REG_TEMPERATURE, 3)
-        self.Ltemp = np.array(left_temp[:Inspire_Num_Motors], dtype=np.float32)
-        self.Rtemp = np.array(right_temp[:Inspire_Num_Motors], dtype=np.float32)
+        if self.right_active:
+            right_angles = self._read_registers_signed(self.right_client, REG_ANGLE_ACT, 6)
+            self.right_hand_state_array = np.array(right_angles, dtype=np.float32)
+            self.Rpos = self.right_hand_state_array.copy()
+            right_current = self._read_registers_signed(self.right_client, REG_CURRENT, 6)
+            self.Rtau = np.array(right_current, dtype=np.float32)
+            right_temp = self._read_registers_bytes(self.right_client, REG_TEMPERATURE, 3)
+            self.Rtemp = np.array(right_temp[:Inspire_Num_Motors], dtype=np.float32)
 
     def _bootstrap_write_default_sync(self):
-        """One-shot synchronous write of the default open pose to both hands.
+        """One-shot synchronous write of the default open pose to active hands.
 
         Used only during __init__ (when re_init=True) and from close(). Must
         only be called from the main thread when workers are not running.
         """
         print("Initializing Inspire hands with default open poses...")
-        left_angles = [int(np.clip(v, 0, 1000)) for v in DEFAULT_QPOS_LEFT]
-        right_angles = [int(np.clip(v, 0, 1000)) for v in DEFAULT_QPOS_RIGHT]
         try:
-            self.left_client.write_registers(REG_ANGLE_SET, left_angles, **self._dev_kwargs)
-            self.right_client.write_registers(REG_ANGLE_SET, right_angles, **self._dev_kwargs)
+            if self.left_active:
+                left_angles = [int(np.clip(v, 0, 1000)) for v in DEFAULT_QPOS_LEFT]
+                self.left_client.write_registers(REG_ANGLE_SET, left_angles, **self._dev_kwargs)
+            if self.right_active:
+                right_angles = [int(np.clip(v, 0, 1000)) for v in DEFAULT_QPOS_RIGHT]
+                self.right_client.write_registers(REG_ANGLE_SET, right_angles, **self._dev_kwargs)
         except Exception as e:
             print(f"Error writing default pose to hands: {e}")
 
@@ -581,10 +603,10 @@ class InspireHandController:
         right_clipped = np.clip(right_fixed, 0, 1000).astype(np.int32)
 
         with self._cmd_lock:
-            if not np.array_equal(left_clipped, self._target_left):
+            if self.left_active and not np.array_equal(left_clipped, self._target_left):
                 self._target_left[:] = left_clipped
                 self._target_dirty_left = True
-            if not np.array_equal(right_clipped, self._target_right):
+            if self.right_active and not np.array_equal(right_clipped, self._target_right):
                 self._target_right[:] = right_clipped
                 self._target_dirty_right = True
 
@@ -618,8 +640,10 @@ class InspireHandController:
                   f"default-pose write on close failed: {e}")
 
         try:
-            self.left_client.close()
-            self.right_client.close()
+            if self.left_client is not None:
+                self.left_client.close()
+            if self.right_client is not None:
+                self.right_client.close()
             print("Inspire hand connections closed.")
         except Exception as e:
             print(f"Error closing Inspire hand connections: {e}")

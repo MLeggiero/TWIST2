@@ -16,5 +16,7 @@ python server_low_level_g1_real.py \
     --device cuda \
     #--use_hand \
     #--hand_type inspire \
+    #--hand_side right \
+    #--dex_finger_tracking \
     # --smooth_body 0.5
     # --record_proprio \

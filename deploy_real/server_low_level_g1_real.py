@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import random
+import sys
+import threading
 import time
 import json
 import numpy as np
@@ -107,7 +109,9 @@ class RealTimePolicyController(object):
                  inspire_right_ip='192.168.123.211',
                  record_proprio=False,
                  smooth_body=0.0,
-                 check_stale=False):
+                 check_stale=False,
+                 dex_finger_tracking=False,
+                 hand_side='both'):
         self.redis_client = None
         try:
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -121,13 +125,17 @@ class RealTimePolicyController(object):
         self.use_hand = use_hand
         self.hand_type = hand_type
         self.hand_dof = 6 if hand_type == 'inspire' else 7
+        self.hand_side = hand_side
         if use_hand:
             if hand_type == 'inspire':
                 self.hand_ctrl = InspireHandController(
                     left_ip=inspire_left_ip,
                     right_ip=inspire_right_ip,
-                    re_init=False)
+                    re_init=False,
+                    active_hand=hand_side)
             else:
+                if hand_side != 'both':
+                    print(f"[WARN] --hand_side={hand_side} ignored for dex3 (only inspire supports single-side).")
                 self.hand_ctrl = Dex3_1_Controller(net, re_init=False)
 
         self.device = device
@@ -184,7 +192,55 @@ class RealTimePolicyController(object):
         else:
             self.body_smoother = None
 
+        # Matches the TWIST reference: the ONNX policy always runs once
+        # reset_robot() hands off to the main loop. The only gate is
+        # `teleop_enabled` (keyboard [a]): when off, the policy is fed the
+        # stand-in-place default mimic obs (robot is alive, balancing, but
+        # not tracking the human); when on, the Redis teleop stream is fed
+        # through. This way teleop can publish continuously and sim2real
+        # solely decides what reaches the robot.
+        self.dex_finger_tracking = dex_finger_tracking
+        self.teleop_enabled = False
+        self._kill_requested = False
+        self._last_hand_left = None
+        self._last_hand_right = None
+        self._default_hand_cmd = np.full(self.hand_dof, 1000.0, dtype=np.float32)
+        if self.dex_finger_tracking:
+            self._start_keyboard_thread()
+
         
+    def _start_keyboard_thread(self):
+        """Line-buffered keyboard listener (finger-tracking mode only).
+
+        Keys:
+            a : toggle teleop_enabled (feedthrough of the Redis teleop stream
+                to the policy). When off the policy tracks the default mimic
+                obs (stand in place).
+            e : emergency stop — exit the run loop immediately.
+        """
+        def loop():
+            print("\n" + "=" * 50)
+            print("GATE CONTROLS (dex finger tracking)")
+            print("  [keyboard a]   : toggle teleop feedthrough (default mimic <-> teleop)")
+            print("  [keyboard e]   : emergency stop")
+            print("  [G1 Select]    : exit")
+            print("=" * 50 + "\n")
+            while True:
+                try:
+                    cmd = input().strip().lower()
+                except EOFError:
+                    return
+                if cmd == 'a':
+                    self.teleop_enabled = not self.teleop_enabled
+                    print(f"[keyboard a] teleop_enabled -> {self.teleop_enabled}")
+                elif cmd == 'e':
+                    print("[keyboard e] emergency stop requested")
+                    self._kill_requested = True
+                    return
+
+        t = threading.Thread(target=loop, name="KbdCtrl", daemon=True)
+        t.start()
+
     def reset_robot(self):
         print("Press START on remote to move to default position ...")
         self.env.move_to_default_pos()
@@ -211,26 +267,41 @@ class RealTimePolicyController(object):
     def run(self):
         self.reset_robot()
         self._init_redis_default_pose()
+
+        # Policy always runs once we enter this loop (matching the TWIST
+        # reference). teleop_enabled starts False so the robot stands in
+        # place until the operator hits keyboard [a] to let the Redis
+        # teleop stream through.
+        self.teleop_enabled = False
+        if self.dex_finger_tracking:
+            print("[INFO] Policy running. teleop_enabled=False — press "
+                  "keyboard [a] to feed the Redis teleop stream to the policy.")
         print("Begin main TWIST2 policy loop. Press [Select] on remote to exit.")
 
         try:
             while True:
                 t_start = time.time()
 
+                # Keyboard emergency stop (dex finger tracking mode)
+                if self._kill_requested:
+                    print("Emergency stop requested, exiting main loop.")
+                    break
+
+                # Read remote controller once per tick (state is level-based).
+                rc_keys = self.env.read_controller_input().keys
+
                 # Send remote control signals to Redis for motion server
                 if self.redis_client:
-                    # Send B button status (for motion start)
-                    b_pressed = self.env.read_controller_input().keys == self.env.controller_mapping["B"]
+                    b_pressed = rc_keys == self.env.controller_mapping["B"]
                     self.redis_client.set("motion_start_signal", "1" if b_pressed else "0")
-                    
-                    # Send Select button status (for motion exit)
-                    select_pressed = self.env.read_controller_input().keys == self.env.controller_mapping["select"]
+
+                    select_pressed = rc_keys == self.env.controller_mapping["select"]
                     self.redis_client.set("motion_exit_signal", "1" if select_pressed else "0")
-                    
-                if self.env.read_controller_input().keys == self.env.controller_mapping["select"]:
+
+                if rc_keys == self.env.controller_mapping["select"]:
                     print("Select pressed, exiting main loop.")
                     break
-                
+
                 dof_pos, dof_vel, quat, ang_vel, dof_temp, dof_tau, dof_vol = self.env.get_robot_state()
                 
                 rpy = quatToEuler(quat)
@@ -290,6 +361,19 @@ class RealTimePolicyController(object):
                 for key in keys:
                     self.redis_pipeline.get(key)
                 redis_results = self.redis_pipeline.execute()
+
+                # Teleop gate (keyboard [a]): feedthrough is paused — feed
+                # the policy the default (stand-in-place) mimic obs instead
+                # of the live Redis stream, and command the hands to default
+                # open. Policy still runs so the robot is balancing.
+                if self.dex_finger_tracking and not self.teleop_enabled:
+                    redis_results = [
+                        json.dumps(DEFAULT_MIMIC_OBS["unitree_g1_with_hands"].tolist()),
+                        json.dumps(self._default_hand_cmd.tolist()),
+                        json.dumps(self._default_hand_cmd.tolist()),
+                        json.dumps([0.0, 0.0]),
+                        str(int(time.time() * 1000)),
+                    ]
 
                 # Check if teleop data exists
                 if redis_results[0] is None:
@@ -375,6 +459,8 @@ class RealTimePolicyController(object):
                 
                 if self.use_hand:
                     self.hand_ctrl.ctrl_dual_hand(action_hand_left, action_hand_right)
+                    self._last_hand_left = action_hand_left
+                    self._last_hand_right = action_hand_right
                 
                 elapsed = time.time() - t_start
                 if elapsed < self.control_dt:
@@ -443,6 +529,16 @@ def main():
                         help='Smoothing factor for body actions (0.0=no smoothing, 1.0=maximum smoothing)')
     parser.add_argument('--check_stale', action='store_true',
                         help='Enable stale teleop data detection (hold pose when data is too old)')
+    parser.add_argument('--dex_finger_tracking', action='store_true',
+                        help='Enable teleop gate (keyboard [a] OR G1 remote A to start/stop, '
+                             '[e] OR G1 remote Select to emergency stop). Use together with '
+                             '--finger_tracking on the teleop side when running without '
+                             'PICO controllers.')
+    parser.add_argument('--hand_side', type=str, default='both',
+                        choices=['both', 'left', 'right'],
+                        help='Which hand(s) to activate. Use "left" or "right" when one '
+                             'Inspire hand is broken/unplugged so the controller skips '
+                             'all Modbus I/O for the disabled side.')
 
     args = parser.parse_args()
 
@@ -463,6 +559,7 @@ def main():
     print(f"  Network interface: {args.net}")
     print(f"  Use hand: {args.use_hand}")
     print(f"  Hand type: {args.hand_type}")
+    print(f"  Hand side: {args.hand_side}")
     if args.hand_type == 'inspire':
         print(f"  Inspire left IP: {args.inspire_left_ip}")
         print(f"  Inspire right IP: {args.inspire_right_ip}")
@@ -491,6 +588,8 @@ def main():
         record_proprio=args.record_proprio,
         smooth_body=args.smooth_body,
         check_stale=args.check_stale,
+        dex_finger_tracking=args.dex_finger_tracking,
+        hand_side=args.hand_side,
     )
     
     controller.run()
