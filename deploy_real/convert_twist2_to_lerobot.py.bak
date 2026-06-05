@@ -44,68 +44,6 @@ DIM_ACTION_LOW_LEVEL = 29  # low-level motor commands
 DIM_TACTILE = 1062
 
 
-# ---------- Attack-phase markers (sidecar written by nav-attack attack_marker.py) ----------
-# The sensor-occlusion experiment marks clean/attack/recovery phases in a
-# separate terminal; those marks live in <data_dir>/attack_markers.jsonl. We
-# join them to each frame here by wall-clock timestamp and emit them as extra
-# observation columns. Absent file => columns omitted (backward compatible).
-PHASE_CLEAN, PHASE_ATTACK, PHASE_RECOVERY, PHASE_RECOVERED = 0, 1, 2, 3
-TARGET_SENSOR_IDS = {"none": 0, "camera": 1, "lidar": 2, "both": 3}
-
-
-def load_attack_markers(path):
-    """Load an attack_markers.jsonl sidecar.
-
-    Returns (header|None, events) where events is a time-sorted list of
-    (t_ms, phase_after). Returns (None, []) if the file is absent. Events with
-    phase_after == None (the logger_stop record) are ignored.
-    """
-    if path is None or not Path(path).exists():
-        return None, []
-    header, events = None, []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                warnings.warn(f"attack markers: skipping malformed line: {line[:80]}")
-                continue
-            if rec.get("type") == "header":
-                header = rec
-            elif rec.get("type") == "event" and rec.get("phase_after") is not None:
-                events.append((int(rec["t_ms"]), int(rec["phase_after"])))
-    events.sort(key=lambda e: e[0])
-    return header, events
-
-
-def phase_at(t_ms, events):
-    """Phase active at wall-clock t_ms = phase_after of the latest event <= t_ms."""
-    if t_ms is None:
-        return PHASE_CLEAN
-    phase = PHASE_CLEAN
-    for et, ep in events:
-        if et <= t_ms:
-            phase = ep
-        else:
-            break
-    return phase
-
-
-def frame_time_ms(frame):
-    """Best wall-clock ms for a recorded frame (camera, then lidar, then state)."""
-    for k in ("t_img", "t_lidar", "t_state"):
-        v = frame.get(k)
-        if v is not None:
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                return None
-    return None
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Convert TWIST2 data to LeRobot format")
     parser.add_argument("--data_dir", type=str, required=True,
@@ -148,10 +86,6 @@ def parse_args():
                         help="Skip episodes with 'unsuccessful' label in data.json")
     parser.add_argument("--image_writer_processes", type=int, default=0)
     parser.add_argument("--image_writer_threads", type=int, default=4)
-
-    parser.add_argument("--attack_markers", type=str, default=None,
-                        help="Attack-phase sidecar JSONL "
-                             "(default: <data_dir>/attack_markers.jsonl if present)")
 
     args = parser.parse_args()
 
@@ -265,22 +199,6 @@ def main():
         raise FileNotFoundError(f"No episode_XXXX directories found in {data_dir}")
     print(f"Found {len(episode_dirs)} episodes in {data_dir}")
 
-    # ---- Attack-phase markers (optional sidecar) ----
-    markers_path = args.attack_markers
-    if markers_path is None:
-        default_markers = data_dir / "attack_markers.jsonl"
-        markers_path = str(default_markers) if default_markers.exists() else None
-    attack_header, attack_events = load_attack_markers(markers_path)
-    attack_loaded = (attack_header is not None) or (len(attack_events) > 0)
-    if attack_loaded:
-        occlusion_level = float((attack_header or {}).get("occlusion_level", 0.0))
-        target_sensor_id = TARGET_SENSOR_IDS.get((attack_header or {}).get("target_sensor", "none"), 0)
-        alginate_int = 1 if (attack_header or {}).get("alginate", False) else 0
-        print(f"Attack markers: {markers_path} ({len(attack_events)} events, "
-              f"sensor_id={target_sensor_id}, occlusion={occlusion_level}, alginate={alginate_int})")
-    else:
-        print("Attack markers: none found (attack columns omitted)")
-
     # Read first image to get actual dimensions
     first_episode_json = episode_dirs[0] / "data.json"
     with open(first_episode_json) as f:
@@ -350,19 +268,6 @@ def main():
             "names": ["tactile"],
         }
 
-    if attack_loaded:
-        # Per-frame sensor-attack annotations. phase: 0 clean / 1 attack /
-        # 2 recovery / 3 recovered. The other three are per-episode constants
-        # carried per-frame so a single parquet row is self-describing.
-        features["observation.attack.phase"] = {
-            "dtype": "int32", "shape": (1,), "names": ["attack_phase"]}
-        features["observation.attack.occlusion_level"] = {
-            "dtype": "float32", "shape": (1,), "names": ["occlusion_level"]}
-        features["observation.attack.target_sensor"] = {
-            "dtype": "int32", "shape": (1,), "names": ["target_sensor"]}
-        features["observation.attack.alginate"] = {
-            "dtype": "int32", "shape": (1,), "names": ["alginate"]}
-
     # Create dataset
     dataset = LeRobotDataset.create(
         repo_id=args.repo_id,
@@ -377,7 +282,6 @@ def main():
 
     total_frames = 0
     skipped_episodes = 0
-    phase_counts = {PHASE_CLEAN: 0, PHASE_ATTACK: 0, PHASE_RECOVERY: 0, PHASE_RECOVERED: 0}
 
     for ep_dir in tqdm(episode_dirs, desc="Converting episodes"):
         json_path = ep_dir / "data.json"
@@ -419,23 +323,11 @@ def main():
             if include_tactile:
                 frame_data["observation.tactile.left_hand"] = build_tactile(frame, idx, "left")
                 frame_data["observation.tactile.right_hand"] = build_tactile(frame, idx, "right")
-            if attack_loaded:
-                phase = phase_at(frame_time_ms(frame), attack_events)
-                phase_counts[phase] = phase_counts.get(phase, 0) + 1
-                frame_data["observation.attack.phase"] = np.array([phase], dtype=np.int32)
-                frame_data["observation.attack.occlusion_level"] = np.array([occlusion_level], dtype=np.float32)
-                frame_data["observation.attack.target_sensor"] = np.array([target_sensor_id], dtype=np.int32)
-                frame_data["observation.attack.alginate"] = np.array([alginate_int], dtype=np.int32)
             dataset.add_frame(frame_data)
 
         dataset.save_episode()
         total_frames += num_frames
         tqdm.write(f"  Saved {ep_dir.name}: {num_frames} frames")
-
-    if attack_loaded:
-        print(f"Attack phase frame counts: clean={phase_counts[PHASE_CLEAN]} "
-              f"attack={phase_counts[PHASE_ATTACK]} recovery={phase_counts[PHASE_RECOVERY]} "
-              f"recovered={phase_counts[PHASE_RECOVERED]}")
 
     print("Finalizing dataset...")
     dataset.finalize()
