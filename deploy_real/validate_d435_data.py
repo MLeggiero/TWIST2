@@ -23,6 +23,8 @@ class EpisodeResult:
         self.rgb_count = 0
         self.depth_count = 0
         self.pointcloud_count = 0
+        self.rgb_wrist_left_count = 0
+        self.rgb_wrist_right_count = 0
         self.warnings = []
         self.errors = []
 
@@ -38,7 +40,12 @@ class EpisodeResult:
     def summary_line(self):
         base = f"{self.name}: {self.status}"
         pc_str = f", pc={self.pointcloud_count}" if self.pointcloud_count > 0 else ""
-        detail = f"({self.n_frames} frames, {self.duration_s:.1f}s, rgb={self.rgb_count}, depth={self.depth_count}{pc_str})"
+        wrist_str = ""
+        if self.rgb_wrist_left_count > 0:
+            wrist_str += f", wrist_left={self.rgb_wrist_left_count}"
+        if self.rgb_wrist_right_count > 0:
+            wrist_str += f", wrist_right={self.rgb_wrist_right_count}"
+        detail = f"({self.n_frames} frames, {self.duration_s:.1f}s, rgb={self.rgb_count}, depth={self.depth_count}{pc_str}{wrist_str})"
         issues = self.errors + self.warnings
         if issues:
             return f"{base}  {detail} — {'; '.join(issues)}"
@@ -62,6 +69,10 @@ def validate_episode(episode_dir, sample_interval=10):
     has_depth_dir = os.path.isdir(depth_dir)
     pointcloud_dir = os.path.join(episode_dir, "pointcloud")
     has_pointcloud_dir = os.path.isdir(pointcloud_dir)
+    rgb_wrist_left_dir = os.path.join(episode_dir, "rgb_wrist_left")
+    has_rgb_wrist_left_dir = os.path.isdir(rgb_wrist_left_dir)
+    rgb_wrist_right_dir = os.path.join(episode_dir, "rgb_wrist_right")
+    has_rgb_wrist_right_dir = os.path.isdir(rgb_wrist_right_dir)
     if not has_rgb_dir and not has_pointcloud_dir:
         result.fail("neither rgb/ nor pointcloud/ directory found")
         return result
@@ -125,6 +136,18 @@ def validate_episode(episode_dir, sample_interval=10):
     else:
         result.pointcloud_count = 0
 
+    if has_rgb_wrist_left_dir:
+        wrist_left_files = os.listdir(rgb_wrist_left_dir)
+        result.rgb_wrist_left_count = len(wrist_left_files)
+        if result.n_frames != result.rgb_wrist_left_count:
+            result.fail(f"rgb_wrist_left count mismatch (json={result.n_frames}, files={result.rgb_wrist_left_count})")
+
+    if has_rgb_wrist_right_dir:
+        wrist_right_files = os.listdir(rgb_wrist_right_dir)
+        result.rgb_wrist_right_count = len(wrist_right_files)
+        if result.n_frames != result.rgb_wrist_right_count:
+            result.fail(f"rgb_wrist_right count mismatch (json={result.n_frames}, files={result.rgb_wrist_right_count})")
+
     if result.n_frames == 0:
         result.warn("episode has 0 frames")
         return result
@@ -145,6 +168,8 @@ def validate_episode(episode_dir, sample_interval=10):
     missing_rgb = 0
     missing_depth = 0
     missing_pc = 0
+    missing_wrist_left = 0
+    missing_wrist_right = 0
     for frame in frames:
         rgb_path = frame.get("rgb")
         if rgb_path:
@@ -161,6 +186,16 @@ def validate_episode(episode_dir, sample_interval=10):
             full = os.path.join(episode_dir, pc_path)
             if not os.path.isfile(full):
                 missing_pc += 1
+        wrist_left_path = frame.get("rgb_wrist_left")
+        if wrist_left_path:
+            full = os.path.join(episode_dir, wrist_left_path)
+            if not os.path.isfile(full):
+                missing_wrist_left += 1
+        wrist_right_path = frame.get("rgb_wrist_right")
+        if wrist_right_path:
+            full = os.path.join(episode_dir, wrist_right_path)
+            if not os.path.isfile(full):
+                missing_wrist_right += 1
 
     if missing_rgb:
         result.fail(f"{missing_rgb} rgb file(s) referenced in JSON but missing on disk")
@@ -168,10 +203,16 @@ def validate_episode(episode_dir, sample_interval=10):
         result.fail(f"{missing_depth} depth file(s) referenced in JSON but missing on disk")
     if missing_pc:
         result.fail(f"{missing_pc} pointcloud file(s) referenced in JSON but missing on disk")
+    if missing_wrist_left:
+        result.fail(f"{missing_wrist_left} rgb_wrist_left file(s) referenced in JSON but missing on disk")
+    if missing_wrist_right:
+        result.fail(f"{missing_wrist_right} rgb_wrist_right file(s) referenced in JSON but missing on disk")
 
     # 7. Image readability & dimensions (sample every Nth frame)
     bad_rgb = 0
     bad_depth = 0
+    bad_wrist_left = 0
+    bad_wrist_right = 0
     for i in range(0, len(frames), sample_interval):
         frame = frames[i]
         rgb_path = frame.get("rgb")
@@ -183,6 +224,19 @@ def validate_episode(episode_dir, sample_interval=10):
                     bad_rgb += 1
                 elif img.shape[0] != height or img.shape[1] != width:
                     bad_rgb += 1
+
+        # No width/height cross-check: info.image describes the D435 stream only.
+        wrist_left_path = frame.get("rgb_wrist_left")
+        if wrist_left_path:
+            full = os.path.join(episode_dir, wrist_left_path)
+            if os.path.isfile(full) and cv2.imread(full) is None:
+                bad_wrist_left += 1
+
+        wrist_right_path = frame.get("rgb_wrist_right")
+        if wrist_right_path:
+            full = os.path.join(episode_dir, wrist_right_path)
+            if os.path.isfile(full) and cv2.imread(full) is None:
+                bad_wrist_right += 1
 
         depth_path = frame.get("depth")
         if depth_path:
@@ -224,6 +278,10 @@ def validate_episode(episode_dir, sample_interval=10):
         result.fail(f"{bad_depth} sampled depth image(s) unreadable, wrong dtype, or wrong dimensions")
     if bad_pc:
         result.fail(f"{bad_pc} sampled pointcloud(s) unreadable, wrong dtype, or wrong shape")
+    if bad_wrist_left:
+        result.fail(f"{bad_wrist_left} sampled rgb_wrist_left image(s) unreadable")
+    if bad_wrist_right:
+        result.fail(f"{bad_wrist_right} sampled rgb_wrist_right image(s) unreadable")
 
     # 8. State/action completeness
     missing_state = 0

@@ -517,6 +517,8 @@ class TeleopControlCenter:
         panels_frame.grid_rowconfigure(2, weight=1)
         panels_frame.grid_rowconfigure(3, weight=1)
         panels_frame.grid_rowconfigure(4, weight=1)
+        panels_frame.grid_rowconfigure(5, weight=1)
+        panels_frame.grid_rowconfigure(6, weight=1)
         panels_frame.grid_columnconfigure(0, weight=1)
 
         # G1 server panels
@@ -552,9 +554,22 @@ class TeleopControlCenter:
                                           custom_kill_cmd="pkill -f mid360_streamer.py")
         self.mid360_panel.frame.grid(row=4, column=0, sticky="nsew", pady=(5, 0))
 
+        # Arducam wrist camera streamer panels
+        self.wrist_left_panel = TerminalPanel(panels_frame, "G1 Wrist Left",
+                                              "bash ~/g1-onboard/start_wrist_left.sh",
+                                              self.colors, is_remote=True,
+                                              custom_kill_cmd="pkill -f 'wrist_streamer.py --device /dev/video_wrist_left'")
+        self.wrist_left_panel.frame.grid(row=5, column=0, sticky="nsew", pady=(5, 5))
+
+        self.wrist_right_panel = TerminalPanel(panels_frame, "G1 Wrist Right",
+                                               "bash ~/g1-onboard/start_wrist_right.sh",
+                                               self.colors, is_remote=True,
+                                               custom_kill_cmd="pkill -f 'wrist_streamer.py --device /dev/video_wrist_right'")
+        self.wrist_right_panel.frame.grid(row=6, column=0, sticky="nsew", pady=(5, 0))
+
         # All control buttons in one row
         buttons_frame = ctk.CTkFrame(panels_frame, fg_color="transparent")
-        buttons_frame.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        buttons_frame.grid(row=7, column=0, sticky="ew", pady=(10, 0))
         
         kill_port_btn = ctk.CTkButton(buttons_frame, text="Kill Port",
                                      command=self._execute_kill_port,
@@ -726,6 +741,7 @@ class TeleopControlCenter:
         self.all_panels = [
             self.neck_panel, self.zed_panel, self.zed_policy_panel,
             self.realsense_panel, self.mid360_panel,
+            self.wrist_left_panel, self.wrist_right_panel,
             self.motion_panel,
             self.teleop_panel, self.visuomotor_panel, self.record_panel,
             self.record_d435_panel, self.record_mid360_panel,

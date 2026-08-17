@@ -1,5 +1,5 @@
 #!/bin/bash
-# Deploy RealSense + MID-360 streamer files to the G1 Orin.
+# Deploy RealSense + MID-360 + wrist camera streamer files to the G1 Orin.
 # Usage: bash deploy_real/onboard/deploy_to_robot.sh
 
 set -e
@@ -16,6 +16,9 @@ scp "${SCRIPT_DIR}/realsense_streamer.py" \
     "${SCRIPT_DIR}/start_realsense.sh" \
     "${SCRIPT_DIR}/mid360_streamer.py" \
     "${SCRIPT_DIR}/start_mid360.sh" \
+    "${SCRIPT_DIR}/wrist_streamer.py" \
+    "${SCRIPT_DIR}/start_wrist_left.sh" \
+    "${SCRIPT_DIR}/start_wrist_right.sh" \
     "${SCRIPT_DIR}/requirements.txt" \
     "${ROBOT_USER}@${ROBOT_IP}:${REMOTE_DIR}/"
 

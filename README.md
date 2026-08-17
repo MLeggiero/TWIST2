@@ -26,6 +26,7 @@ By Yanjie Ze, Siheng Zhao, Weizhuo Wang, Angjoo Kanazawa†, Rocky Duan†, Piet
 - [Installation](#installation)
 - [Usage](#usage)
 - [RealSense D435i Camera Integration](#realsense-d435i-camera-integration)
+- [Wrist Camera Integration](#wrist-camera-integration)
 - [Inspire Hand Control](#inspire-hand-control)
 - [Pico 4 Ultra Finger Tracking](#pico-4-ultra-finger-tracking)
 - [Citation and Contact](#citation-and-contact)
@@ -332,6 +333,42 @@ python validate_d435_data.py twist2_demonstration/<task_name> --show    # Visual
 ```
 
 For full details (wire format, CLI flags, troubleshooting), see [doc/REALSENSE_CAMERA.md](./doc/REALSENSE_CAMERA.md).
+
+# Wrist Camera Integration
+
+Two Arducam USB2.0 fisheye cameras are mounted on the G1's wrists, connected to the Orin via USB like the D435i. Each streams **RGB only** at **640x480 @ 30fps** over ZMQ, and both are merged into the **same synchronized episode** as the D435 recorder so all camera views + robot state/action stay frame-aligned for fine-manipulation policy training.
+
+### Quick Start
+
+1. **Deploy the streamers to the Orin:**
+```bash
+bash deploy_real/onboard/deploy_to_robot.sh
+```
+
+2. **Start both wrist streamers on the Orin:**
+```bash
+ssh unitree@192.168.123.164
+bash ~/g1-onboard/start_wrist_left.sh &
+bash ~/g1-onboard/start_wrist_right.sh &
+```
+
+3. **Start the recorder on the workstation**, with wrist ports enabled:
+```bash
+cd deploy_real
+python server_data_record_d435.py --wrist_left_port 5556 --wrist_right_port 5558
+```
+
+4. **Toggle recording** with the PICO controller (same button drives all cameras):
+   - **Left controller Y button** — start/stop episode recording
+   - **Left controller axis click** — quit recording
+
+### Data Format
+Wrist frames are added to the same `episode_XXXX/data.json` as D435, under new `rgb_wrist_left/` and `rgb_wrist_right/` JPEG subdirectories.
+
+### Validation
+`validate_d435_data.py` checks the wrist directories automatically when present — no separate command needed.
+
+For full details (udev setup for stable camera identity, wire format, CLI flags, troubleshooting), see [doc/WRIST_CAMERAS.md](./doc/WRIST_CAMERAS.md).
 
 
 # Inspire Hand Control

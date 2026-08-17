@@ -4,7 +4,10 @@
 Data collection script for the internal RealSense D435i camera.
 
 Collects RGB + aligned depth from the D435i (via ZMQ), plus body/hand
-state and action from Redis, and writes episodes to disk.
+state and action from Redis, and writes episodes to disk. Optionally also
+merges in RGB from the two Arducam wrist cameras (--wrist_left_port /
+--wrist_right_port), so a single episode/data.json stays frame-aligned
+across all camera views and the robot state/action.
 
 Differences from server_data_record.py (ZED):
   - Single 424x240 RGB image (not stereo 1280x360)
@@ -65,6 +68,25 @@ def main(args):
     )
     depth_array = np.ndarray(depth_shape, dtype=np.float32, buffer=depth_shared_memory.buf)
 
+    # ---- Shared memory for wrist cameras (RGB only, no depth) ----
+    wrist_image_shape = (args.wrist_height, args.wrist_width, 3)
+
+    wrist_left_shared_memory = None
+    wrist_left_array = None
+    if args.wrist_left_port is not None:
+        wrist_left_shared_memory = shared_memory.SharedMemory(
+            create=True, size=int(np.prod(wrist_image_shape) * np.uint8().itemsize)
+        )
+        wrist_left_array = np.ndarray(wrist_image_shape, dtype=np.uint8, buffer=wrist_left_shared_memory.buf)
+
+    wrist_right_shared_memory = None
+    wrist_right_array = None
+    if args.wrist_right_port is not None:
+        wrist_right_shared_memory = shared_memory.SharedMemory(
+            create=True, size=int(np.prod(wrist_image_shape) * np.uint8().itemsize)
+        )
+        wrist_right_array = np.ndarray(wrist_image_shape, dtype=np.uint8, buffer=wrist_right_shared_memory.buf)
+
     # ---- Vision client ----
     try:
         cv2.namedWindow("__test__", cv2.WINDOW_NORMAL)
@@ -87,9 +109,33 @@ def main(args):
     vision_thread = threading.Thread(target=vision_client.receive_process, daemon=True)
     vision_thread.start()
 
+    if args.wrist_left_port is not None:
+        wrist_left_client = VisionClient(
+            server_address=args.robot_ip,
+            port=args.wrist_left_port,
+            img_shape=wrist_image_shape,
+            img_shm_name=wrist_left_shared_memory.name,
+            unit_test=True,
+        )
+        threading.Thread(target=wrist_left_client.receive_process, daemon=True).start()
+
+    if args.wrist_right_port is not None:
+        wrist_right_client = VisionClient(
+            server_address=args.robot_ip,
+            port=args.wrist_right_port,
+            img_shape=wrist_image_shape,
+            img_shm_name=wrist_right_shared_memory.name,
+            unit_test=True,
+        )
+        threading.Thread(target=wrist_right_client.receive_process, daemon=True).start()
+
     # ---- Episode writer ----
     recording = False
     save_data_keys = ["rgb", "depth"]
+    if args.wrist_left_port is not None:
+        save_data_keys.append("rgb_wrist_left")
+    if args.wrist_right_port is not None:
+        save_data_keys.append("rgb_wrist_right")
     task_dir = os.path.join(args.data_folder, args.task_name)
     recorder = EpisodeWriter(
         task_dir=task_dir,
@@ -177,6 +223,14 @@ def main(args):
                     data_dict["depth"] = raw_depth.astype(np.uint16)
                 else:
                     data_dict["depth"] = None
+
+                # Wrist cameras: same-tick copy keeps frames aligned with D435 + state/action
+                if wrist_left_array is not None:
+                    data_dict["rgb_wrist_left"] = wrist_left_array.copy()
+                    data_dict["t_img_wrist_left"] = int(time.time() * 1000)
+                if wrist_right_array is not None:
+                    data_dict["rgb_wrist_right"] = wrist_right_array.copy()
+                    data_dict["t_img_wrist_right"] = int(time.time() * 1000)
 
                 # ---- Redis state & action ----
                 redis_keys = [
@@ -273,6 +327,12 @@ def main(args):
         image_shared_memory.close()
         depth_shared_memory.unlink()
         depth_shared_memory.close()
+        if wrist_left_shared_memory is not None:
+            wrist_left_shared_memory.unlink()
+            wrist_left_shared_memory.close()
+        if wrist_right_shared_memory is not None:
+            wrist_right_shared_memory.unlink()
+            wrist_right_shared_memory.close()
         recorder.close()
         try:
             cv2.destroyAllWindows()
@@ -294,6 +354,12 @@ if __name__ == "__main__":
     parser.add_argument("--camera_port", default=5555, type=int, help="ZMQ port for D435i streamer")
     parser.add_argument("--width", default=1280, type=int, help="Image width")
     parser.add_argument("--height", default=720, type=int, help="Image height")
+
+    # Wrist camera options. Omit both ports to keep D435-only behavior.
+    parser.add_argument("--wrist_left_port", default=None, type=int, help="ZMQ port for left wrist streamer (omit to disable)")
+    parser.add_argument("--wrist_right_port", default=None, type=int, help="ZMQ port for right wrist streamer (omit to disable)")
+    parser.add_argument("--wrist_width", default=640, type=int, help="Wrist camera image width")
+    parser.add_argument("--wrist_height", default=480, type=int, help="Wrist camera image height")
 
     # Task description metadata
     parser.add_argument("--goal", default="pick up the red cup", help="Task goal description")

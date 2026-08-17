@@ -254,6 +254,8 @@ def build_modality_json() -> dict:
         "tactile_hand_right": tactile_groups,
         "video": {
             "rgb": {"original_key": "observation.images.rgb"},
+            "rgb_wrist_left": {"original_key": "observation.images.rgb_wrist_left"},
+            "rgb_wrist_right": {"original_key": "observation.images.rgb_wrist_right"},
         },
         "annotation": {
             "human.task_description": {"original_key": "text.goal"},

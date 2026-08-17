@@ -124,6 +124,16 @@ class EpisodeWriter():
             os.makedirs(self.depth_dir, exist_ok=True)
             print(f"==> depth_dir: {self.depth_dir}")
 
+        if "rgb_wrist_left" in self.data_keys:
+            self.rgb_wrist_left_dir = os.path.join(self.episode_dir, 'rgb_wrist_left')
+            os.makedirs(self.rgb_wrist_left_dir, exist_ok=True)
+            print(f"==> rgb_wrist_left_dir: {self.rgb_wrist_left_dir}")
+
+        if "rgb_wrist_right" in self.data_keys:
+            self.rgb_wrist_right_dir = os.path.join(self.episode_dir, 'rgb_wrist_right')
+            os.makedirs(self.rgb_wrist_right_dir, exist_ok=True)
+            print(f"==> rgb_wrist_right_dir: {self.rgb_wrist_right_dir}")
+
         if "pointcloud" in self.data_keys:
             self.pointcloud_dir = os.path.join(self.episode_dir, 'pointcloud')
             os.makedirs(self.pointcloud_dir, exist_ok=True)
@@ -190,6 +200,22 @@ class EpisodeWriter():
             if not cv2.imwrite(save_path, rgb):
                 print(f"Failed to save rgb image.")
             item_data['rgb'] = str(Path(save_path).relative_to(Path(self.json_path).parent))
+
+        rgb_wrist_left = item_data.get('rgb_wrist_left', None)
+        if rgb_wrist_left is not None:
+            color_name = f'{str(idx).zfill(6)}.jpg'
+            save_path = os.path.join(self.rgb_wrist_left_dir, color_name)
+            if not cv2.imwrite(save_path, rgb_wrist_left):
+                print(f"Failed to save rgb_wrist_left image.")
+            item_data['rgb_wrist_left'] = str(Path(save_path).relative_to(Path(self.json_path).parent))
+
+        rgb_wrist_right = item_data.get('rgb_wrist_right', None)
+        if rgb_wrist_right is not None:
+            color_name = f'{str(idx).zfill(6)}.jpg'
+            save_path = os.path.join(self.rgb_wrist_right_dir, color_name)
+            if not cv2.imwrite(save_path, rgb_wrist_right):
+                print(f"Failed to save rgb_wrist_right image.")
+            item_data['rgb_wrist_right'] = str(Path(save_path).relative_to(Path(self.json_path).parent))
 
         # Save depth images as raw uint16 .npy
         depth = item_data.get('depth', None)
