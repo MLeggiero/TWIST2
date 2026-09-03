@@ -20,6 +20,7 @@ import cv2
 import numpy as np
 from multiprocessing import shared_memory, Array, Lock
 import threading
+from data_utils.wuji_recording import build_wuji_recording_schema, validate_wuji_record
 from data_utils.episode_writer import EpisodeWriter
 from data_utils.vision_client import VisionClient
 from rich import print
@@ -31,8 +32,8 @@ def main(args):
     # Connect to Redis with connection pool for better performance
     try:
         redis_pool = redis.ConnectionPool(
-            host="localhost", 
-            port=6379, 
+            host=args.redis_ip,
+            port=args.redis_port,
             db=0,
             max_connections=10,
             retry_on_timeout=True,
@@ -43,7 +44,7 @@ def main(args):
         redis_pipeline = redis_client.pipeline()
         # Test connection
         redis_client.ping()
-        print(f"Connected to Redis at localhost:6379, DB=0 with connection pool")
+        print(f"Connected to Redis at {args.redis_ip}:{args.redis_port}, DB=0 with connection pool")
     except Exception as e:
         print(f"Error connecting to Redis: {e}")
         return
@@ -76,9 +77,20 @@ def main(args):
     recording = False
     save_data_keys = ['rgb']
     task_dir = os.path.join(args.data_folder, args.task_name)
-    recorder = EpisodeWriter(task_dir = task_dir, frequency = args.frequency,
-                             image_shape=image_shape,
-                             data_keys=save_data_keys)
+    writer_kwargs = {}
+    if args.hand_backend == "wuji":
+        modality, schema = build_wuji_recording_schema()
+        writer_kwargs.update(
+            metadata={
+                "hand_backend": "wuji_hand_2", "hand_action_dim": 20,
+                "human_hand_format": "mediapipe_21x3", "human_hand_units": "meters",
+            },
+            modality_json=modality,
+            schema_block=schema,
+        )
+    recorder = EpisodeWriter(task_dir=task_dir, frequency=args.frequency,
+                             image_shape=image_shape, data_keys=save_data_keys,
+                             **writer_kwargs)
     recorder.text_desc(goal="walk ahead and pick a box.",
                        desc="a humanoid robot walk head and pick a box from the table.",
                        steps="step1: walk ahead 1 meter. step2: pick a box from the table.")
@@ -138,49 +150,40 @@ def main(args):
                 data_dict["t_img"] = int(time.time() * 1000) # current timestamp in ms
 
                 # Pipeline Redis operations for better performance
-                redis_keys = [
-                    "state_body_unitree_g1_with_hands",
-                    "state_hand_left_unitree_g1_with_hands",
-                    "state_hand_right_unitree_g1_with_hands",
-                    "state_neck_unitree_g1_with_hands",
-                    "t_state",
-
-                    "action_body_unitree_g1_with_hands",
-                    "action_hand_left_unitree_g1_with_hands",
-                    "action_hand_right_unitree_g1_with_hands",
-                    "action_neck_unitree_g1_with_hands",
-                    "t_action",
-
-                    "force_hand_left_unitree_g1_with_hands",
-                    "force_hand_right_unitree_g1_with_hands",
-
-                    "tactile_hand_left_unitree_g1_with_hands",
-                    "tactile_hand_right_unitree_g1_with_hands",
-
-                    "effort_body_unitree_g1_with_hands",
-                ]
-
-                data_dict_keys = [
-                    "state_body",
-                    "state_hand_left",
-                    "state_hand_right",
-                    "state_neck",
-                    "t_state",
-
-                    "action_body",
-                    "action_hand_left",
-                    "action_hand_right",
-                    "action_neck",
-                    "t_action",
-
-                    "force_hand_left",
-                    "force_hand_right",
-
-                    "tactile_hand_left",
-                    "tactile_hand_right",
-
-                    "effort_body",
-                ]
+                if args.hand_backend == "dex3":
+                    redis_keys = [
+                        "state_body_unitree_g1_with_hands", "state_hand_left_unitree_g1_with_hands",
+                        "state_hand_right_unitree_g1_with_hands", "state_neck_unitree_g1_with_hands", "t_state",
+                        "action_body_unitree_g1_with_hands", "action_hand_left_unitree_g1_with_hands",
+                        "action_hand_right_unitree_g1_with_hands", "action_neck_unitree_g1_with_hands", "t_action",
+                        "force_hand_left_unitree_g1_with_hands", "force_hand_right_unitree_g1_with_hands",
+                        "tactile_hand_left_unitree_g1_with_hands", "tactile_hand_right_unitree_g1_with_hands",
+                        "effort_body_unitree_g1_with_hands",
+                    ]
+                    data_dict_keys = [
+                        "state_body", "state_hand_left", "state_hand_right", "state_neck", "t_state",
+                        "action_body", "action_hand_left", "action_hand_right", "action_neck", "t_action",
+                        "force_hand_left", "force_hand_right", "tactile_hand_left", "tactile_hand_right",
+                        "effort_body",
+                    ]
+                else:
+                    redis_keys = [
+                        "state_body_unitree_g1_with_hands", "wuji_state_hand_left", "wuji_state_hand_right",
+                        "state_neck_unitree_g1_with_hands", "t_state", "action_body_unitree_g1_with_hands",
+                        "wuji_action_hand_left", "wuji_action_hand_right",
+                        "action_neck_unitree_g1_with_hands", "t_action", "effort_body_unitree_g1_with_hands",
+                        "pico_hand_left_mediapipe", "pico_hand_right_mediapipe",
+                        "pico_hand_left_timestamp", "pico_hand_right_timestamp",
+                        "wuji_action_timestamp_left", "wuji_action_timestamp_right",
+                        "wuji_state_timestamp_left", "wuji_state_timestamp_right",
+                    ]
+                    data_dict_keys = [
+                        "state_body", "state_hand_left", "state_hand_right", "state_neck", "t_state",
+                        "action_body", "action_hand_left", "action_hand_right", "action_neck", "t_action",
+                        "effort_body", "human_hand_left", "human_hand_right",
+                        "t_human_hand_left", "t_human_hand_right", "t_action_hand_left",
+                        "t_action_hand_right", "t_state_hand_left", "t_state_hand_right",
+                    ]
                 
                 try:
                     # Use Redis pipeline to batch all GET operations (1 network round-trip instead of 10)
@@ -206,6 +209,8 @@ def main(args):
                     continue
                 
                 # write data to recorder
+                if args.hand_backend == "wuji":
+                    validate_wuji_record(data_dict, args.wuji_data_timeout)
                 recorder.add_item(data_dict)
                 
                 if image_show:
@@ -269,6 +274,12 @@ if __name__ == "__main__":
     parser.add_argument("--robot", default="unitree_g1", choices=["unitree_g1"], help="robot name")
     parser.add_argument("--robot_ip", default="192.168.123.164", help="robot ip")
     
+    parser.add_argument("--hand-backend", default="dex3", choices=["dex3", "wuji"],
+                        help="Redis hand schema; dex3 preserves existing behavior")
+    parser.add_argument("--redis-ip", default="localhost", help="Redis host")
+    parser.add_argument("--redis-port", default=6379, type=int, help="Redis port")
+    parser.add_argument("--wuji-data-timeout", default=1.0, type=float,
+                        help="Maximum Wuji/PICO sample age recorded in seconds")
     args = parser.parse_args()
 
     main(args)

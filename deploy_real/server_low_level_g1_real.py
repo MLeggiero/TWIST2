@@ -107,7 +107,8 @@ class RealTimePolicyController(object):
                  inspire_right_ip='192.168.123.211',
                  record_proprio=False,
                  smooth_body=0.0,
-                 check_stale=False):
+                 check_stale=False,
+                 ignore_hand_actions=False):
         self.redis_client = None
         try:
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -119,6 +120,7 @@ class RealTimePolicyController(object):
         self.config = Config(config_path)
         self.env = G1RealWorldEnv(net=net, config=self.config)
         self.use_hand = use_hand
+        self.ignore_hand_actions = ignore_hand_actions
         self.hand_type = hand_type
         self.hand_dof = 6 if hand_type == 'inspire' else 7
         if use_hand:
@@ -201,8 +203,9 @@ class RealTimePolicyController(object):
         default_neck = [0.0, 0.0]
 
         self.redis_pipeline.set("action_body_unitree_g1_with_hands", json.dumps(default_body.tolist()))
-        self.redis_pipeline.set("action_hand_left_unitree_g1_with_hands", json.dumps(default_hand.tolist()))
-        self.redis_pipeline.set("action_hand_right_unitree_g1_with_hands", json.dumps(default_hand.tolist()))
+        if not self.ignore_hand_actions:
+            self.redis_pipeline.set("action_hand_left_unitree_g1_with_hands", json.dumps(default_hand.tolist()))
+            self.redis_pipeline.set("action_hand_right_unitree_g1_with_hands", json.dumps(default_hand.tolist()))
         self.redis_pipeline.set("action_neck_unitree_g1_with_hands", json.dumps(default_neck))
         self.redis_pipeline.set("t_action", str(int(time.time() * 1000)))
         self.redis_pipeline.execute()
@@ -294,9 +297,13 @@ class RealTimePolicyController(object):
                 self.redis_pipeline.execute()
 
                 # 5. 从 Redis 接收模仿观察 (with staleness check)
-                keys = ["action_body_unitree_g1_with_hands", "action_hand_left_unitree_g1_with_hands",
-                        "action_hand_right_unitree_g1_with_hands", "action_neck_unitree_g1_with_hands",
-                        "t_action"]
+                if self.ignore_hand_actions:
+                    keys = ["action_body_unitree_g1_with_hands",
+                            "action_neck_unitree_g1_with_hands", "t_action"]
+                else:
+                    keys = ["action_body_unitree_g1_with_hands", "action_hand_left_unitree_g1_with_hands",
+                            "action_hand_right_unitree_g1_with_hands", "action_neck_unitree_g1_with_hands",
+                            "t_action"]
                 for key in keys:
                     self.redis_pipeline.get(key)
                 redis_results = self.redis_pipeline.execute()
@@ -315,7 +322,7 @@ class RealTimePolicyController(object):
                 # Check staleness via t_action timestamp (only if enabled)
                 data_is_stale = False
                 if self.check_stale:
-                    t_action_raw = redis_results[4]
+                    t_action_raw = redis_results[-1]
                     if t_action_raw is not None:
                         t_action = int(t_action_raw)
                         t_now_ms = int(time.time() * 1000)
@@ -341,9 +348,14 @@ class RealTimePolicyController(object):
                     continue
 
                 action_mimic = json.loads(redis_results[0])
-                action_hand_left = json.loads(redis_results[1])
-                action_hand_right = json.loads(redis_results[2])
-                action_neck = json.loads(redis_results[3])
+                if self.ignore_hand_actions:
+                    action_hand_left = np.zeros(self.hand_dof, dtype=np.float32)
+                    action_hand_right = np.zeros(self.hand_dof, dtype=np.float32)
+                    action_neck = json.loads(redis_results[1])
+                else:
+                    action_hand_left = json.loads(redis_results[1])
+                    action_hand_right = json.loads(redis_results[2])
+                    action_neck = json.loads(redis_results[3])
                 
                 # Apply smoothing to body actions if enabled
                 if self.body_smoother is not None:
@@ -440,6 +452,8 @@ def main():
                         help='Network interface for robot communication')
     parser.add_argument('--use_hand', action='store_true',
                         help='Enable hand control')
+    parser.add_argument('--ignore-hand-actions', action='store_true',
+                        help='Body-only mode: do not read, initialize, or command legacy hand keys')
     parser.add_argument('--hand_type', type=str, default='dex3',
                         choices=['dex3', 'inspire'],
                         help='Type of dextrous hand (dex3 or inspire)')
@@ -455,6 +469,9 @@ def main():
                         help='Enable stale teleop data detection (hold pose when data is too old)')
 
     args = parser.parse_args()
+
+    if args.use_hand and args.ignore_hand_actions:
+        parser.error('--use_hand and --ignore-hand-actions are mutually exclusive')
 
     
     # 验证文件存在
@@ -476,6 +493,7 @@ def main():
     if args.hand_type == 'inspire':
         print(f"  Inspire left IP: {args.inspire_left_ip}")
         print(f"  Inspire right IP: {args.inspire_right_ip}")
+    print(f"  Ignore hand actions: {args.ignore_hand_actions}")
     print(f"  Record proprio: {args.record_proprio}")
     print(f"  Smooth body: {args.smooth_body}")
     print(f"  Check stale: {args.check_stale}")
@@ -501,6 +519,7 @@ def main():
         record_proprio=args.record_proprio,
         smooth_body=args.smooth_body,
         check_stale=args.check_stale,
+        ignore_hand_actions=args.ignore_hand_actions,
     )
     
     controller.run()

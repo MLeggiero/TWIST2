@@ -40,6 +40,7 @@ from data_utils.finger_tracking import PicoFingerTracker
 from data_utils.fps_monitor import FPSMonitor
 from data_utils.params import DEFAULT_HAND_POSE, DEFAULT_MIMIC_OBS
 from data_utils.rot_utils import euler_from_quaternion_np, quat_diff_np, quat_rotate_inverse_np
+from pico_hand_utils import pico_hand_to_mediapipe
 from general_motion_retargeting import (
     ROBOT_BASE_DICT,
     ROBOT_XML_DICT,
@@ -108,6 +109,47 @@ def extract_mimic_obs_whole_body(qpos, last_qpos, dt=1/30):
     
     return mimic_obs
 
+
+class SourceTimestampWatchdog:
+    """Track whether an XR source timestamp is advancing locally.
+
+    The first observed timestamp is deliberately not accepted as fresh. The
+    XRoboToolkit SDK caches its last frame, so a nonzero timestamp alone does
+    not prove that the headset is still sending data. A second, different
+    timestamp establishes liveness; short duplicate runs are then tolerated
+    for ``timeout`` seconds because the producer may run faster than PICO.
+    """
+
+    def __init__(self, timeout):
+        self.timeout = float(timeout)
+        if self.timeout <= 0:
+            raise ValueError("source timestamp timeout must be positive")
+        self.last_timestamp = None
+        self.last_advance_time = None
+
+    def observe(self, timestamp, now=None):
+        now = time.monotonic() if now is None else float(now)
+        try:
+            timestamp = int(timestamp)
+        except (TypeError, ValueError, OverflowError):
+            timestamp = None
+        if timestamp is not None and timestamp <= 0:
+            timestamp = None
+
+        advanced = False
+        if timestamp is not None:
+            if self.last_timestamp is None:
+                self.last_timestamp = timestamp
+            elif timestamp != self.last_timestamp:
+                self.last_timestamp = timestamp
+                self.last_advance_time = now
+                advanced = True
+
+        fresh = (
+            self.last_advance_time is not None
+            and now - self.last_advance_time <= self.timeout
+        )
+        return advanced, fresh
 
 
 class StateMachine:
@@ -588,7 +630,16 @@ class XRobotTeleopToRobot:
         self.xml_file = ROBOT_XML_DICT[args.robot]
         self.robot_base = ROBOT_BASE_DICT[args.robot]
         self.hand_type = getattr(args, 'hand_type', 'dex3')
+        self.hand_output_mode = getattr(args, 'hand_output_mode', 'dex3')
         self.use_finger_tracking = getattr(args, 'finger_tracking', False)
+        self.require_fresh_xr_tracking = getattr(
+            args, 'require_fresh_xr_tracking', False
+        )
+        source_timeout = getattr(args, 'xr_source_timeout', 0.5)
+        self.xr_frame_watchdog = SourceTimestampWatchdog(source_timeout)
+        self.body_frame_watchdog = SourceTimestampWatchdog(source_timeout)
+        self.latest_retarget_obs = None
+        self.last_xr_warning_time = 0.0
         # Select hand pose configuration based on hand type
         if self.hand_type == 'inspire':
             self.hand_pose_key = "unitree_g1_inspire"
@@ -596,9 +647,12 @@ class XRobotTeleopToRobot:
             self.hand_pose_key = args.robot
 
         print(f"Hand type: {self.hand_type}")
+        print(f"Hand output mode: {self.hand_output_mode}")
         print(f"Hand pose config: {self.hand_pose_key}")
         print(f"Pinch mode: {self.args.pinch_mode}")
         print(f"Finger tracking: {self.use_finger_tracking}")
+        if self.require_fresh_xr_tracking:
+            print("Fresh XR source timestamps are required")
         # Initialize state tracking
         self.last_qpos = None
         self.last_time = time.time()
@@ -694,6 +748,51 @@ class XRobotTeleopToRobot:
         if self.teleop_data_streamer is not None:
             return self.teleop_data_streamer.get_current_frame()
         return None, None, None, None, None
+
+    @staticmethod
+    def _controller_source_timestamp(controller_data):
+        if not isinstance(controller_data, dict):
+            return None
+        return controller_data.get('timestamp')
+
+    @staticmethod
+    def _body_source_timestamp():
+        """Read the body packet timestamp from the already initialized SDK."""
+        try:
+            import xrobotoolkit_sdk as xrt
+
+            if not xrt.is_body_data_available():
+                return None
+            timestamp = int(xrt.get_body_timestamp_ns())
+            return timestamp if timestamp > 0 else None
+        except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+
+    def observe_xr_sources(self, smplx_data, controller_data):
+        """Return liveness for the overall XR packet and body substream."""
+        source_timestamp = self._controller_source_timestamp(controller_data)
+        hand_advanced, _ = self.xr_frame_watchdog.observe(source_timestamp)
+
+        body_timestamp = self._body_source_timestamp()
+        if body_timestamp is None:
+            # Older bindings may not expose a usable body timestamp. The
+            # top-level XR packet timestamp is still better than accepting a
+            # cached frame while the headset is disconnected or Send is off.
+            body_timestamp = source_timestamp
+        body_advanced, body_fresh = self.body_frame_watchdog.observe(body_timestamp)
+        body_fresh = body_fresh and smplx_data is not None
+
+        if self.require_fresh_xr_tracking and not body_fresh:
+            now = time.monotonic()
+            if now - self.last_xr_warning_time >= 2.0:
+                print(
+                    "[bold yellow]WARNING: XR body timestamp is not advancing; "
+                    "ignoring cached body poses. In XRoboToolkit select Full "
+                    "Body, turn Send on, and turn 'Switch w/ A Button' off.[/bold yellow]"
+                )
+                self.last_xr_warning_time = now
+
+        return hand_advanced, body_advanced, body_fresh, body_timestamp
         
     def process_retargeting(self, smplx_data):
         """Process motion retargeting and return observations"""
@@ -858,7 +957,11 @@ class XRobotTeleopToRobot:
         # Default fallback
         return [0.0, 0.0]
             
-    def send_to_redis(self, mimic_obs, neck_data=None):
+    def send_to_redis(self, mimic_obs, neck_data=None,
+                      left_hand_data=None, right_hand_data=None,
+                      hand_source_advanced=True,
+                      body_source_advanced=False,
+                      body_source_timestamp=None):
         """Send mimic observations to Redis"""
         
         if self.redis_client is not None and mimic_obs is not None:
@@ -868,10 +971,31 @@ class XRobotTeleopToRobot:
             self.redis_pipeline.set("action_body_unitree_g1_with_hands", json.dumps(mimic_obs.tolist()))
         
         # Send hand action to redis
-        if self.redis_client is not None:
+        if self.redis_client is not None and self.hand_output_mode == "dex3":
             hand_left_pose, hand_right_pose = self.state_machine.get_hand_pose(self.hand_pose_key)
             self.redis_pipeline.set("action_hand_left_unitree_g1_with_hands", json.dumps(hand_left_pose.tolist()))
             self.redis_pipeline.set("action_hand_right_unitree_g1_with_hands", json.dumps(hand_right_pose.tolist()))
+        elif self.redis_client is not None and self.hand_output_mode == "wuji":
+            now = time.time()
+            left_kp = pico_hand_to_mediapipe(left_hand_data, "Left")
+            right_kp = pico_hand_to_mediapipe(right_hand_data, "Right")
+            allow_hand_publish = (
+                hand_source_advanced
+                or not getattr(self, 'require_fresh_xr_tracking', False)
+            )
+            if left_kp is not None and allow_hand_publish:
+                self.redis_pipeline.set("pico_hand_left_mediapipe", json.dumps(left_kp.tolist()))
+                self.redis_pipeline.set("pico_hand_left_timestamp", str(now))
+            if right_kp is not None and allow_hand_publish:
+                self.redis_pipeline.set("pico_hand_right_mediapipe", json.dumps(right_kp.tolist()))
+                self.redis_pipeline.set("pico_hand_right_timestamp", str(now))
+            if body_source_advanced:
+                self.redis_pipeline.set("pico_body_timestamp", str(now))
+                if body_source_timestamp is not None:
+                    self.redis_pipeline.set(
+                        "pico_body_source_timestamp_ns",
+                        str(int(body_source_timestamp)),
+                    )
         
         # Send neck data to redis
         if neck_data is not None:
@@ -1045,6 +1169,14 @@ class XRobotTeleopToRobot:
             while viewer.is_running():
                 # Get current teleop data
                 smplx_data, left_hand_data, right_hand_data, controller_data, headset_data = self.get_teleop_data()
+                hand_source_advanced = True
+                body_source_advanced = False
+                body_source_timestamp = None
+                if self.hand_output_mode == "wuji" or self.require_fresh_xr_tracking:
+                    (hand_source_advanced, body_source_advanced,
+                     _body_tracking_fresh, body_source_timestamp) = self.observe_xr_sources(
+                        smplx_data, controller_data
+                    )
                 
                 # Process keyboard commands (finger tracking mode)
                 if self.use_finger_tracking:
@@ -1056,7 +1188,8 @@ class XRobotTeleopToRobot:
                     self.send_controller_data_to_redis(controller_data)
                 
                 # Update hand poses from finger tracking
-                if self.use_finger_tracking and self.state_machine.is_teleop_active():
+                if (self.hand_output_mode == "dex3" and self.use_finger_tracking
+                        and self.state_machine.is_teleop_active()):
                     self.state_machine.update_hand_from_tracking(left_hand_data, right_hand_data)
                 
                 # Check if we should exit
@@ -1067,9 +1200,17 @@ class XRobotTeleopToRobot:
                 
                 # Process retargeting if we have data
                 qpos, current_retarget_obs = None, None
-                if smplx_data is not None:
+                should_process_body = smplx_data is not None and (
+                    not self.require_fresh_xr_tracking or body_source_advanced
+                )
+                if should_process_body:
                     qpos, current_retarget_obs = self.process_retargeting(smplx_data)
+                    self.latest_retarget_obs = current_retarget_obs
                     self.update_visualization(qpos, smplx_data, viewer)
+                elif self.require_fresh_xr_tracking:
+                    # Reuse the last genuinely received target between PICO
+                    # frames. Never retarget the SDK's cached startup frame.
+                    current_retarget_obs = self.latest_retarget_obs
                 
                 # Handle state transitions
                 self.handle_state_transitions(current_retarget_obs)
@@ -1082,7 +1223,15 @@ class XRobotTeleopToRobot:
                 if neck_data_to_send is not None:
                     self.state_machine.set_current_neck_data(neck_data_to_send)
                 
-                self.send_to_redis(mimic_obs_to_send, neck_data_to_send)
+                self.send_to_redis(
+                    mimic_obs_to_send,
+                    neck_data_to_send,
+                    left_hand_data,
+                    right_hand_data,
+                    hand_source_advanced=hand_source_advanced,
+                    body_source_advanced=body_source_advanced,
+                    body_source_timestamp=body_source_timestamp,
+                )
                 
                 # Update visualization and record video
                 viewer.sync()
@@ -1112,6 +1261,14 @@ def parse_arguments():
         default="dex3",
         choices=["dex3", "inspire"],
         help="Type of dextrous hand (dex3 or inspire).",
+    )
+    parser.add_argument(
+        "--hand-output-mode",
+        default="dex3",
+        choices=["dex3", "wuji"],
+        help=("Hand Redis output. 'dex3' preserves the existing Dex3/Inspire "
+              "behavior selected by --hand_type; 'wuji' publishes PICO "
+              "MediaPipe landmarks on separate keys."),
     )
     parser.add_argument(
         "--pinch_mode",
@@ -1165,6 +1322,19 @@ def parse_arguments():
         action="store_true",
         help="Use Pico 4 Ultra finger tracking for Inspire hand control instead of controller buttons.",
         default=False,
+    )
+    parser.add_argument(
+        "--require-fresh-xr-tracking",
+        action="store_true",
+        help=("Reject cached XR body/hand frames until their source timestamp "
+              "advances. Intended for the Wuji launch path; disabled by "
+              "default to preserve existing teleop behavior."),
+    )
+    parser.add_argument(
+        "--xr-source-timeout",
+        type=float,
+        default=0.5,
+        help="Seconds an advancing XR source timestamp remains fresh (default: 0.5).",
     )
     parser.add_argument(
         "--fine_span",

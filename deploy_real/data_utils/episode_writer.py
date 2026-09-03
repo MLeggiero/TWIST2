@@ -22,7 +22,8 @@ from data_utils.g1_schema import (
 class EpisodeWriter():
     def __init__(self, task_dir, frequency=30,
                  image_shape=(480, 640, 3),
-                 data_keys = ['rgb']):
+                 data_keys = ['rgb'], metadata=None,
+                 modality_json=None, schema_block=None):
         """
         image_shape: [width, height, channel]
         state_shape: [29]
@@ -31,6 +32,8 @@ class EpisodeWriter():
         print("==> EpisodeWriter initializing...\n")
         self.task_dir = task_dir
         self.frequency = frequency
+        self.modality_json = modality_json
+        self.schema_block = schema_block
         self.image_shape = image_shape
         self.data_keys = data_keys
         
@@ -47,6 +50,8 @@ class EpisodeWriter():
             os.makedirs(self.task_dir)
             print(f"==> episode directory does not exist, now create one.\n")
         self.data_info()
+        if metadata:
+            self.info.update(metadata)
         self.text_desc()
         self._write_modality_json()
 
@@ -88,7 +93,7 @@ class EpisodeWriter():
             os.makedirs(meta_dir, exist_ok=True)
             modality_path = os.path.join(meta_dir, "modality.json")
             with open(modality_path, "w", encoding="utf-8") as f:
-                json.dump(build_modality_json(), f, indent=4, ensure_ascii=False)
+                json.dump(self.modality_json or build_modality_json(), f, indent=4, ensure_ascii=False)
             print(f"==> wrote modality.json -> {modality_path}")
         except Exception as e:
             print(f"==> Warning: failed to write modality.json ({e})")
@@ -327,7 +332,7 @@ class EpisodeWriter():
         # to consult any other file to interpret the flat state/action
         # vectors (see data_utils/g1_schema.build_schema_block).
         try:
-            self.data['schema'] = build_schema_block()
+            self.data['schema'] = self.schema_block or build_schema_block()
         except Exception as e:
             print(f"==> Warning: failed to attach schema block ({e})")
         self.data['data'] = self.episode_data
