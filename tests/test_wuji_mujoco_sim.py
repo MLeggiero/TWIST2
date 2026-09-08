@@ -83,6 +83,13 @@ class WujiMujocoSimulationTest(unittest.TestCase):
         self.assertIsNone(decode_vector("[1, 2]", 20))
         self.assertIsNone(decode_vector("not json", 20))
 
+    def test_fresh_pico_body_flag_is_opt_in_at_python_cli(self):
+        base = ["--left-config", str(self.configs["left"]), "--model-only"]
+        self.assertFalse(parse_args(base).require_fresh_pico_body)
+        self.assertTrue(
+            parse_args(base + ["--require-fresh-pico-body"]).require_fresh_pico_body
+        )
+
     def test_model_only_does_not_require_policy(self):
         args = parse_args(
             ["--left-config", str(self.configs["left"]), "--model-only"]

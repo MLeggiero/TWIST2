@@ -633,6 +633,7 @@ def main(argv=None) -> int:
     policy = Path(args.policy).expanduser().resolve()
     if not policy.is_file():
         raise FileNotFoundError(f"TWIST2 policy not found: {policy}")
+    print(f"TWIST2 ONNX checkpoint: {policy}")
     controller = G1WujiMujocoController(
         bundle=bundle,
         policy_path=policy,

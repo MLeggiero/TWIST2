@@ -155,7 +155,8 @@ class SourceTimestampWatchdog:
 class StateMachine:
     def __init__(self, enable_smooth=False, smooth_window_size=5, use_pinch=False,
                  use_finger_tracking=False, hand_type='dex3', grip_thumb=False,
-                 fine_span=250.0, thumb_rate=500.0):
+                 fine_span=250.0, thumb_rate=500.0,
+                 wuji_left_inspire_right=False):
         """
         State process for teleoperation:
         idle -> teleop -> pause -> teleop ... -> idle -> exit
@@ -182,6 +183,7 @@ class StateMachine:
 
         # Hand type
         self.hand_type = hand_type
+        self.wuji_left_inspire_right = bool(wuji_left_inspire_right)
 
         # Hand state - interpolation values (0.0 = open, 1.0 = closed)
         self.hand_left_position = 0.0  # 0.0 = fully open, 1.0 = fully closed (Dex3)
@@ -431,8 +433,17 @@ class StateMachine:
         right_axis = controller_data.get('RightController', {}).get('axis', [0.0, 0.0])
         
         if self.hand_type == 'inspire':
-            # Both joysticks used for thumb control in Inspire mode, no velocity commands
-            self.velocity_commands[:] = 0.0
+            if self.wuji_left_inspire_right and len(left_axis) >= 2:
+                # In hybrid mode only the right joystick belongs to the Inspire
+                # thumb. Keep the otherwise-unused left stick available for G1
+                # planar motion; yaw remains zero to avoid sharing the right stick.
+                xy_scale = 2.0
+                self.velocity_commands[0] = left_axis[1] * xy_scale
+                self.velocity_commands[1] = -left_axis[0] * xy_scale
+                self.velocity_commands[2] = 0.0
+            else:
+                # Both joysticks used for thumb control in Inspire mode, no velocity commands
+                self.velocity_commands[:] = 0.0
         elif len(left_axis) >= 2 and len(right_axis) >= 2:
             # Use left stick for xy movement, right stick X for yaw rotation
             xy_scale = 2.0  # m/s
@@ -599,24 +610,22 @@ class StateMachine:
             self.finger_tracker.reset()
     
     def _emergency_stop(self):
-        """Emergency stop: kill sim2real.sh process (server_low_level_g1_real_future.py)"""
+        """Emergency stop the legacy and current real G1 controller processes."""
         try:
-            print("[EMERGENCY STOP] Killing sim2real.sh process...")
-            # Kill sim2real.sh which contains server_low_level_g1_real_future.py
-            result = subprocess.run(['pkill', '-f', 'sim2real.sh'], 
-                                  capture_output=True, text=True, timeout=5)
-            if result.returncode == 0:
-                print("[EMERGENCY STOP] Successfully killed sim2real.sh process")
-            else:
-                print(f"[EMERGENCY STOP] pkill returned code {result.returncode}")
-
-            # Also try to kill the specific server script directly as backup
-            result2 = subprocess.run(['pkill', '-f', 'server_low_level_g1_real_future.py'], 
-                                   capture_output=True, text=True, timeout=5)
-            if result2.returncode == 0:
-                print("[EMERGENCY STOP] Successfully killed server_low_level_g1_real_future.py process")
-            else:
-                print(f"[EMERGENCY STOP] pkill for server script returned code {result2.returncode}")
+            print("[EMERGENCY STOP] Stopping real G1 controller processes...")
+            for pattern in (
+                'sim2real.sh',
+                'sim2real_wuji.sh',
+                'sim2real_wuji_left_inspire_right.sh',
+                'server_low_level_g1_real_future.py',
+                'server_low_level_g1_real.py',
+            ):
+                result = subprocess.run(
+                    ['pkill', '-f', pattern], capture_output=True,
+                    text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    print(f"[EMERGENCY STOP] Stopped process matching {pattern}")
                 
         except subprocess.TimeoutExpired:
             print("[EMERGENCY STOP] pkill command timed out")
@@ -636,6 +645,8 @@ class XRobotTeleopToRobot:
             args, 'require_fresh_xr_tracking', False
         )
         source_timeout = getattr(args, 'xr_source_timeout', 0.5)
+        self.xr_source_timeout = float(source_timeout)
+        self.xr_watchdog_started_at = time.monotonic()
         self.xr_frame_watchdog = SourceTimestampWatchdog(source_timeout)
         self.body_frame_watchdog = SourceTimestampWatchdog(source_timeout)
         self.latest_retarget_obs = None
@@ -645,6 +656,11 @@ class XRobotTeleopToRobot:
             self.hand_pose_key = "unitree_g1_inspire"
         else:
             self.hand_pose_key = args.robot
+        if (self.hand_output_mode == "wuji-left-inspire-right"
+                and self.hand_type != "inspire"):
+            raise ValueError(
+                "wuji-left-inspire-right requires --hand_type inspire"
+            )
 
         print(f"Hand type: {self.hand_type}")
         print(f"Hand output mode: {self.hand_output_mode}")
@@ -674,6 +690,9 @@ class XRobotTeleopToRobot:
             grip_thumb=args.grip_thumb,
             fine_span=getattr(args, 'fine_span', 250.0),
             thumb_rate=getattr(args, 'thumb_rate', 500.0),
+            wuji_left_inspire_right=(
+                self.hand_output_mode == "wuji-left-inspire-right"
+            ),
         )
         self.rate = None
         
@@ -784,7 +803,9 @@ class XRobotTeleopToRobot:
 
         if self.require_fresh_xr_tracking and not body_fresh:
             now = time.monotonic()
-            if now - self.last_xr_warning_time >= 2.0:
+            startup_elapsed = now - self.xr_watchdog_started_at
+            if (startup_elapsed >= self.xr_source_timeout
+                    and now - self.last_xr_warning_time >= 2.0):
                 print(
                     "[bold yellow]WARNING: XR body timestamp is not advancing; "
                     "ignoring cached body poses. In XRoboToolkit select Full "
@@ -975,7 +996,9 @@ class XRobotTeleopToRobot:
             hand_left_pose, hand_right_pose = self.state_machine.get_hand_pose(self.hand_pose_key)
             self.redis_pipeline.set("action_hand_left_unitree_g1_with_hands", json.dumps(hand_left_pose.tolist()))
             self.redis_pipeline.set("action_hand_right_unitree_g1_with_hands", json.dumps(hand_right_pose.tolist()))
-        elif self.redis_client is not None and self.hand_output_mode == "wuji":
+        elif self.redis_client is not None and self.hand_output_mode in (
+            "wuji", "wuji-left-inspire-right"
+        ):
             now = time.time()
             left_kp = pico_hand_to_mediapipe(left_hand_data, "Left")
             right_kp = pico_hand_to_mediapipe(right_hand_data, "Right")
@@ -989,6 +1012,22 @@ class XRobotTeleopToRobot:
             if right_kp is not None and allow_hand_publish:
                 self.redis_pipeline.set("pico_hand_right_mediapipe", json.dumps(right_kp.tolist()))
                 self.redis_pipeline.set("pico_hand_right_timestamp", str(now))
+            if (self.hand_output_mode == "wuji-left-inspire-right"
+                    and allow_hand_publish):
+                _left_unused, right_pose = self.state_machine.get_hand_pose(
+                    self.hand_pose_key
+                )
+                right_pose = np.asarray(right_pose, dtype=np.float32)
+                if right_pose.shape != (6,) or not np.all(np.isfinite(right_pose)):
+                    raise ValueError(
+                        "hybrid right Inspire command must be finite shape (6,)"
+                    )
+                self.redis_pipeline.set(
+                    "inspire_action_hand_right", json.dumps(right_pose.tolist())
+                )
+                self.redis_pipeline.set(
+                    "inspire_action_timestamp_right", str(now)
+                )
             if body_source_advanced:
                 self.redis_pipeline.set("pico_body_timestamp", str(now))
                 if body_source_timestamp is not None:
@@ -1188,7 +1227,8 @@ class XRobotTeleopToRobot:
                     self.send_controller_data_to_redis(controller_data)
                 
                 # Update hand poses from finger tracking
-                if (self.hand_output_mode == "dex3" and self.use_finger_tracking
+                if (self.hand_output_mode in ("dex3", "wuji-left-inspire-right")
+                        and self.use_finger_tracking
                         and self.state_machine.is_teleop_active()):
                     self.state_machine.update_hand_from_tracking(left_hand_data, right_hand_data)
                 
@@ -1265,10 +1305,12 @@ def parse_arguments():
     parser.add_argument(
         "--hand-output-mode",
         default="dex3",
-        choices=["dex3", "wuji"],
+        choices=["dex3", "wuji", "wuji-left-inspire-right"],
         help=("Hand Redis output. 'dex3' preserves the existing Dex3/Inspire "
               "behavior selected by --hand_type; 'wuji' publishes PICO "
-              "MediaPipe landmarks on separate keys."),
+              "MediaPipe landmarks on separate keys; "
+              "'wuji-left-inspire-right' additionally publishes one "
+              "timestamped 6-D right Inspire target."),
     )
     parser.add_argument(
         "--pinch_mode",

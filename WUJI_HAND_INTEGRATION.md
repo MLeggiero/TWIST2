@@ -29,6 +29,17 @@ checkout. Current local Wuji Hand 2 configs are named
 `adaptive_analytical_wuji_glove_wuji_hand_2_{left,right}.yaml`; despite the name,
 they consume standard MediaPipe 21x3 landmarks.
 
+## PICO tracker setup
+
+With two ankle trackers plus both controllers and the headset, calibrate the PICO
+Motion Trackers in full-body mode while standing upright after every headset
+activation. In XRoboToolkit, select **PICO Motion Tracker Mode: Full Body**, set
+the tracker count to 2, enable **Send**, and disable **Switch w/ A Button**. The
+latter conflicts with TWIST2's right-controller A binding for idle/teleop/pause.
+The producer preview must be upright and visibly follow motion before either a
+MuJoCo or physical G1 consumer is started. See
+[`WUJI_MUJOCO_TESTING.md`](WUJI_MUJOCO_TESTING.md#pico-full-body-setup-and-freshness-preflight).
+
 ## Redis schema
 
 All new timestamps are Unix epoch seconds. The legacy `t_action` remains milliseconds.
@@ -39,6 +50,8 @@ All new timestamps are Unix epoch seconds. The legacy `t_action` remains millise
 | `pico_hand_right_mediapipe` | 21x3 | PICO/GMR producer | bridge, recorder |
 | `pico_hand_left_timestamp` | scalar | PICO/GMR producer | bridge, recorder |
 | `pico_hand_right_timestamp` | scalar | PICO/GMR producer | bridge, recorder |
+| `pico_body_timestamp` | scalar | PICO/GMR producer | Wuji MuJoCo simulator |
+| `pico_body_source_timestamp_ns` | scalar | XRoboToolkit via producer | diagnostics |
 | `wuji_action_hand_left` | 20 | bridge | recorder |
 | `wuji_action_hand_right` | 20 | bridge | recorder |
 | `wuji_state_hand_left` | 20 | bridge | recorder |
@@ -154,8 +167,10 @@ velocity ceiling. Dry-run does not interpolate.
 ## Combined launch
 
 1. Start the existing Redis service.
-2. Start XRoboToolkit and connect PICO.
-3. Run `bash teleop_wuji.sh` in the `gmr` environment.
+2. Calibrate the two PICO ankle trackers, connect XRoboToolkit, select Full Body,
+   turn Send on, and turn Switch w/ A Button off.
+3. Run `bash teleop_wuji.sh` in the `gmr` environment and confirm its GMR preview
+   is upright and follows you before pressing A.
 4. Run `bash wuji_hand_bridge.sh --dry-run` with config environment variables.
 5. After validation, restart the bridge without `--dry-run` and with hand addresses.
 6. Run `bash sim2real_wuji.sh` for the physical G1 body.
@@ -174,18 +189,30 @@ declare 20-D radians and MediaPipe 21x3 metres; legacy metadata is unchanged.
 
 ## Tracking loss
 
-The default freshness timeout is 0.25 seconds. On loss, no new target is calculated
-or sent; the last target is held and warnings are throttled. Zeros or an open pose are
-never substituted. `--disable-after-timeout 0` disables automatic motor shutdown.
+The bridge's hand-landmark freshness timeout is 0.25 seconds. The Wuji producer
+launcher additionally rejects cached XR frames: source timestamps must advance,
+and only then are `pico_body_timestamp` or hand timestamps refreshed. The combined
+MuJoCo simulator continues running its balance policy on the last valid high-level
+body target. On hand tracking loss, no new target is calculated or sent; the last
+target is held and warnings are throttled. Zeros or an open pose are never
+substituted. `--disable-after-timeout 0` disables automatic motor shutdown.
 If a positive long timeout is selected and expires, motors are disabled and the
 bridge must be restarted before motion resumes.
 
 ## Troubleshooting
 
-- `tracking stale`: confirm producer/bridge clocks and PICO timestamps.
+- frozen or kneeling GMR preview: complete PICO full-body calibration, verify both
+  ankle trackers, enable XRoboToolkit Full Body + Send, and disable Switch w/ A.
+- `tracking stale`: confirm `pico_body_timestamp` advances and producer/bridge clocks
+  agree.
 - invalid `21x3`: verify all required XRoboToolkit keys and corrected Palm/Wrist order.
 - URDF/MJCF alignment error: verify both assets in the YAML describe the same hand.
 - partial measured state: inspect offline joints/diagnostics; incomplete frames are
   intentionally not published.
 - multiple devices found: pass the correct explicit hand address.
 - Redis connection failure: set `REDIS_IP`/`REDIS_PORT` consistently for all processes.
+
+For the optional left-Wuji/right-Inspire hardware layout, see
+[`WUJI_INSPIRE_HYBRID.md`](WUJI_INSPIRE_HYBRID.md). That mode uses distinct
+per-side Redis ownership and does not change the default dual-Wuji or legacy
+Dex3/Inspire workflows.

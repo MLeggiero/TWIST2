@@ -130,7 +130,7 @@ DEFAULT_QPOS_RIGHT = DEFAULT_HAND_POSE["unitree_g1_inspire"]["right"]["open"]
 class InspireHandController:
     def __init__(self, left_ip='192.168.123.210', right_ip='192.168.123.211',
                  port=6000, device_id=1, re_init=True,
-                 enable_left=True, enable_right=True):
+                 enable_left=True, enable_right=True, strict_io=False):
         """
         Initialize Inspire hand controller via Modbus TCP.
 
@@ -152,12 +152,15 @@ class InspireHandController:
             re_init: Whether to clear errors and move to default position
             enable_left: Connect to and control the left hand (default True)
             enable_right: Connect to and control the right hand (default True)
+            strict_io: Raise during bootstrap and preserve invalid worker state
+                on Modbus failures. Disabled by default for legacy compatibility.
         """
         if not (enable_left or enable_right):
             raise ValueError("At least one of enable_left/enable_right must be True")
 
         self.enable_left = enable_left
         self.enable_right = enable_right
+        self.strict_io = bool(strict_io)
 
         print("Initialize InspireHandController...")
         print(f"  Left hand:  {left_ip}:{port} ({'enabled' if enable_left else 'DISABLED'})")
@@ -234,7 +237,17 @@ class InspireHandController:
         # Read initial state synchronously — must happen before workers start
         # so that consumers never see zeroed caches and TCP failures raise
         # from __init__ as they do today.
-        self._bootstrap_read_sync()
+        try:
+            self._bootstrap_read_sync()
+        except Exception:
+            # strict_io is used by the hybrid path. If its initial feedback
+            # read fails, release every socket opened before propagating the
+            # error so a retry does not inherit a half-open device session.
+            if self.left_client is not None:
+                self.left_client.close()
+            if self.right_client is not None:
+                self.right_client.close()
+            raise
         print(f"  Left hand state: {self.left_hand_state_array}")
         print(f"  Right hand state: {self.right_hand_state_array}")
 
@@ -279,9 +292,13 @@ class InspireHandController:
                 packed = struct.pack('>' + 'H' * count, *response.registers)
                 return list(struct.unpack('>' + 'h' * count, packed))
             else:
+                if self.strict_io:
+                    raise IOError(f"Modbus error reading registers at {address}")
                 print(f"Error reading registers at {address}")
                 return [0] * count
         except Exception as e:
+            if self.strict_io:
+                raise
             print(f"Exception reading registers at {address}: {e}")
             return [0] * count
 
@@ -296,9 +313,13 @@ class InspireHandController:
                     byte_list.append(reg & 0xFF)
                 return byte_list
             else:
+                if self.strict_io:
+                    raise IOError(f"Modbus error reading byte registers at {address}")
                 print(f"Error reading byte registers at {address}")
                 return [0] * (count * 2)
         except Exception as e:
+            if self.strict_io:
+                raise
             print(f"Exception reading byte registers at {address}: {e}")
             return [0] * (count * 2)
 
@@ -449,10 +470,26 @@ class InspireHandController:
 
                 if target_to_write is not None:
                     try:
-                        client.write_registers(
+                        response = client.write_registers(
                             REG_ANGLE_SET, target_to_write, **self._dev_kwargs)
+                        if (self.strict_io and response is not None
+                                and response.isError()):
+                            raise IOError("Modbus rejected angle command")
                         self._note_ok(side)
                     except Exception as e:
+                        if self.strict_io:
+                            # Retry an unchanged failed target on the next
+                            # worker iteration. Do not overwrite a newer
+                            # last-wins target. Legacy mode retains its
+                            # previous drop-on-error behavior.
+                            with self._cmd_lock:
+                                current = (self._target_left if is_left
+                                           else self._target_right)
+                                if np.array_equal(current, target_to_write):
+                                    if is_left:
+                                        self._target_dirty_left = True
+                                    else:
+                                        self._target_dirty_right = True
                         self._note_error(side, f"write_registers: {e}")
 
                 # --- 2a. Read angle_act ---
@@ -614,12 +651,13 @@ class InspireHandController:
         print("Initializing Inspire hands with default open poses...")
         self.ctrl_dual_hand(DEFAULT_QPOS_LEFT, DEFAULT_QPOS_RIGHT)
 
-    def close(self):
+    def close(self, move_to_default=True):
         """Stop workers, command default open pose, and disconnect TCP clients.
 
         Order matters: stop workers and join them before the main thread
         touches the Modbus clients, otherwise we'd race the worker on the
-        same socket.
+        same socket. ``move_to_default=False`` disconnects without opening;
+        the default remains ``True`` to preserve existing Inspire behavior.
         """
         self._stop_event.set()
 
@@ -631,12 +669,13 @@ class InspireHandController:
                           f"worker {label} did not exit within 1s")
 
         # Workers stopped — main thread now owns both clients again.
-        try:
-            self._bootstrap_write_default_sync()
-            time.sleep(0.5)  # let actuators physically start opening
-        except Exception as e:
-            print(f"[InspireHandController] warning: "
-                  f"default-pose write on close failed: {e}")
+        if move_to_default:
+            try:
+                self._bootstrap_write_default_sync()
+                time.sleep(0.5)  # let actuators physically start opening
+            except Exception as e:
+                print(f"[InspireHandController] warning: "
+                      f"default-pose write on close failed: {e}")
 
         try:
             if self.left_client is not None:

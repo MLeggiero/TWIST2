@@ -14,7 +14,10 @@ try:
     import mujoco
 
     import server_low_level_g1_wuji_sim as sim_server
-    from server_low_level_g1_wuji_sim import G1WujiMujocoController
+    from server_low_level_g1_wuji_sim import (
+        DEFAULT_BODY_MIMIC,
+        G1WujiMujocoController,
+    )
     from wuji_mujoco_model import compose_g1_wuji_model
 except ImportError:
     mujoco = None
@@ -79,9 +82,10 @@ class WujiMujocoControllerTest(unittest.TestCase):
 
         class FakePolicy:
             def __init__(self, *_args, **_kwargs):
-                pass
+                self.calls = 0
 
             def __call__(self, observation):
+                self.calls += 1
                 self.last_observation = observation
                 return np.zeros(29, dtype=np.float64)
 
@@ -102,8 +106,20 @@ class WujiMujocoControllerTest(unittest.TestCase):
                 headless=True,
                 max_steps=20,
                 print_every=0,
+                require_fresh_pico_body=True,
             )
             controller.run()
+
+        # The fake producer has no pico_body_timestamp. The simulator must
+        # nevertheless keep invoking the closed-loop policy using its safe
+        # upright startup target, rather than accepting cached all-zero input.
+        self.assertEqual(controller.policy.calls, 2)
+        np.testing.assert_allclose(
+            controller.policy.last_observation[:35], DEFAULT_BODY_MIMIC
+        )
+        np.testing.assert_allclose(
+            controller.policy.last_observation[-35:], DEFAULT_BODY_MIMIC
+        )
 
         body = np.asarray(
             json.loads(fake_redis.values["state_body_unitree_g1_with_hands"])

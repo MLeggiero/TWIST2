@@ -21,6 +21,10 @@ import numpy as np
 from multiprocessing import shared_memory, Array, Lock
 import threading
 from data_utils.wuji_recording import build_wuji_recording_schema, validate_wuji_record
+from data_utils.hybrid_hand_recording import (
+    build_hybrid_hand_recording_schema,
+    validate_hybrid_hand_record,
+)
 from data_utils.episode_writer import EpisodeWriter
 from data_utils.vision_client import VisionClient
 from rich import print
@@ -84,6 +88,20 @@ def main(args):
             metadata={
                 "hand_backend": "wuji_hand_2", "hand_action_dim": 20,
                 "human_hand_format": "mediapipe_21x3", "human_hand_units": "meters",
+            },
+            modality_json=modality,
+            schema_block=schema,
+        )
+    elif args.hand_backend == "wuji-left-inspire-right":
+        modality, schema = build_hybrid_hand_recording_schema()
+        writer_kwargs.update(
+            metadata={
+                "hand_backend_left": "wuji_hand_2",
+                "hand_action_dim_left": 20,
+                "hand_backend_right": "inspire_rh56",
+                "hand_action_dim_right": 6,
+                "human_hand_format": "mediapipe_21x3",
+                "human_hand_units": "meters",
             },
             modality_json=modality,
             schema_block=schema,
@@ -166,7 +184,7 @@ def main(args):
                         "force_hand_left", "force_hand_right", "tactile_hand_left", "tactile_hand_right",
                         "effort_body",
                     ]
-                else:
+                elif args.hand_backend == "wuji":
                     redis_keys = [
                         "state_body_unitree_g1_with_hands", "wuji_state_hand_left", "wuji_state_hand_right",
                         "state_neck_unitree_g1_with_hands", "t_state", "action_body_unitree_g1_with_hands",
@@ -183,6 +201,36 @@ def main(args):
                         "effort_body", "human_hand_left", "human_hand_right",
                         "t_human_hand_left", "t_human_hand_right", "t_action_hand_left",
                         "t_action_hand_right", "t_state_hand_left", "t_state_hand_right",
+                    ]
+                else:
+                    redis_keys = [
+                        "state_body_unitree_g1_with_hands",
+                        "wuji_state_hand_left", "inspire_state_hand_right",
+                        "state_neck_unitree_g1_with_hands", "t_state",
+                        "action_body_unitree_g1_with_hands",
+                        "wuji_action_hand_left", "inspire_command_hand_right",
+                        "action_neck_unitree_g1_with_hands", "t_action",
+                        "effort_body_unitree_g1_with_hands",
+                        "pico_hand_left_mediapipe", "pico_hand_right_mediapipe",
+                        "pico_hand_left_timestamp", "pico_hand_right_timestamp",
+                        "wuji_action_timestamp_left",
+                        "inspire_command_timestamp_right",
+                        "wuji_state_timestamp_left",
+                        "inspire_state_timestamp_right",
+                        "inspire_force_hand_right",
+                        "inspire_tactile_hand_right",
+                        "inspire_temperature_hand_right",
+                    ]
+                    data_dict_keys = [
+                        "state_body", "state_hand_left", "state_hand_right",
+                        "state_neck", "t_state", "action_body",
+                        "action_hand_left", "action_hand_right", "action_neck",
+                        "t_action", "effort_body", "human_hand_left",
+                        "human_hand_right", "t_human_hand_left",
+                        "t_human_hand_right", "t_action_hand_left",
+                        "t_action_hand_right", "t_state_hand_left",
+                        "t_state_hand_right", "force_hand_right",
+                        "tactile_hand_right", "temperature_hand_right",
                     ]
                 
                 try:
@@ -211,6 +259,8 @@ def main(args):
                 # write data to recorder
                 if args.hand_backend == "wuji":
                     validate_wuji_record(data_dict, args.wuji_data_timeout)
+                elif args.hand_backend == "wuji-left-inspire-right":
+                    validate_hybrid_hand_record(data_dict, args.wuji_data_timeout)
                 recorder.add_item(data_dict)
                 
                 if image_show:
@@ -274,7 +324,8 @@ if __name__ == "__main__":
     parser.add_argument("--robot", default="unitree_g1", choices=["unitree_g1"], help="robot name")
     parser.add_argument("--robot_ip", default="192.168.123.164", help="robot ip")
     
-    parser.add_argument("--hand-backend", default="dex3", choices=["dex3", "wuji"],
+    parser.add_argument("--hand-backend", default="dex3",
+                        choices=["dex3", "wuji", "wuji-left-inspire-right"],
                         help="Redis hand schema; dex3 preserves existing behavior")
     parser.add_argument("--redis-ip", default="localhost", help="Redis host")
     parser.add_argument("--redis-port", default=6379, type=int, help="Redis port")

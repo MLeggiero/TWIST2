@@ -1,5 +1,10 @@
 # Testing TWIST2 + Wuji Hand 2 in MuJoCo
 
+The asymmetric left-Wuji/right-Inspire workflow is documented separately in
+[`WUJI_INSPIRE_HYBRID.md`](WUJI_INSPIRE_HYBRID.md). This repository currently
+has no Inspire MJCF, so the standard combined simulator can validate a left-only
+Wuji command path but not right-Inspire articulation or accurate hybrid mass.
+
 This runbook tests the unchanged 29-DOF TWIST2 body policy together with one or
 two 20-DOF Wuji Hand 2 models. It is a software-only gate before physical G1 or
 Wuji operation. Nothing in this workflow imports `wuji_sdk`, enables motors, or
@@ -116,7 +121,42 @@ python -m unittest tests.test_wuji_mujoco_sim \
 
 These checks verify model dimensions, actuator ordering against the official
 standalone Wuji MJCFs, placeholder-hand removal, finite physics stepping, JSON
-command validation, and hardware-free model-only operation.
+command validation, cached-frame rejection, and hardware-free model-only operation.
+
+## PICO full-body setup and freshness preflight
+
+Start the installed XRoboToolkit PC service in its own terminal:
+
+```bash
+/opt/apps/roboticsservice/run3D.sh
+```
+
+Keep the service and its UI running. This is the command used by the installed
+`XRoboToolkit-PC-Service` desktop launcher; its wrapper configures the bundled
+library and Qt paths, so do not run `RoboticsServiceProcess` directly.
+
+For a headset, two hand controllers, and two ankle-mounted PICO Motion Trackers:
+
+1. Wear one tracker on each ankle in the orientation shown by PICO.
+2. Open the PICO Motion Tracker calibration flow and complete the quick full-body
+   calibration while standing upright. PICO requires this again after each headset
+   activation.
+3. In the XRoboToolkit headset panel, confirm the PC connection says `WORKING`.
+4. Enable Head, Controller, and Hand tracking as needed. Set **PICO Motion Tracker
+   Mode** to **Full Body**, with tracker count 2, and turn **Send** on.
+5. Turn **Switch w/ A Button** off. XRoboToolkit can use A to pause/resume Send,
+   while TWIST2 also uses right-controller A to enter/pause teleoperation. Leaving
+   both enabled can freeze the exact frame that TWIST2 then tries to track.
+
+These settings follow the upstream
+[XRoboToolkit Unity client panel](https://github.com/XR-Robotics/XRoboToolkit-Unity-Client#unity-ui-main-panel-reference)
+and PICO's
+[body-tracking calibration sequence](https://github.com/picoxr/Pico-Body-Tracking-Demo#usage).
+
+`teleop_wuji.sh` enables `--require-fresh-xr-tracking`. A cached frame is not
+accepted merely because the SDK still reports body data available: its source
+timestamp must change at least once. Only advancing frames refresh
+`pico_body_timestamp` and the PICO hand timestamps.
 
 ## Test 3: validate PICO hand retargeting without hardware
 
@@ -132,6 +172,28 @@ Start XRoboToolkit and connect PICO. In another terminal, start the producer:
 cd ~/Projects/TWIST2
 REDIS_IP=localhost ACTUAL_HUMAN_HEIGHT=<HEIGHT_METERS> bash teleop_wuji.sh
 ```
+
+The producer's MuJoCo window is a kinematic GMR preview, not the dynamically
+balanced robot. Before pressing A or launching the combined simulator, stand
+upright and move your head, controllers, and ankles. The preview must follow. If
+it remains kneeling or frozen, stop here and repair the XR settings/calibration.
+The console should otherwise warn that the XR body timestamp is not advancing.
+
+Verify the source heartbeat from another terminal:
+
+```bash
+python - <<'PY'
+import time
+import redis
+r = redis.Redis()
+raw = r.get("pico_body_timestamp")
+print("missing" if raw is None else f"age={time.time() - float(raw):.3f}s")
+PY
+```
+
+An actively streaming body should report an age below the default 0.5-second
+source timeout. This check tests source liveness, unlike `t_action`, which is the
+producer loop timestamp.
 
 Start the Wuji bridge in dry-run mode:
 
@@ -168,7 +230,13 @@ bash sim2sim_wuji.sh
 ```
 
 The launcher reads `WUJI_LEFT_CONFIG`/`WUJI_RIGHT_CONFIG`, uses the provided
-TWIST2 ONNX checkpoint, and opens one MuJoCo viewer. Expected behavior:
+TWIST2 ONNX checkpoint, enables `--require-fresh-pico-body`, and opens one MuJoCo
+viewer. Start it while TWIST2 is still in idle; the G1 should stand. Once the GMR
+preview is upright and moving, press right-controller A once to enter teleop.
+At startup, verify that `TWIST2 ONNX checkpoint:` prints the expected resolved
+checkpoint path. The default is `assets/ckpts/twist2_1017_20k.onnx`; set
+`TWIST2_POLICY` to override it.
+Expected behavior:
 
 - the G1 stands under the existing 29-DOF policy;
 - body motion follows the 35-D PICO/GMR target;
@@ -197,16 +265,19 @@ bash sim2sim_wuji.sh \
 ```
 
 The simulator clips hand commands to the official MJCF actuator control ranges.
-If a command or timestamp is absent, malformed, or stale, it holds the last valid
-target and prints a throttled warning. It never substitutes an open or zero pose
-after tracking loss.
+If a hand command or timestamp is absent, malformed, or stale, it holds the last
+valid hand target. If PICO body input is missing or stale, the simulator keeps
+running the closed-loop balance policy on the last valid 35-D target; before the
+first proven-live PICO frame, that target is the normal upright default. It never
+accepts the SDK's cached startup pose or substitutes an open/zero hand pose.
+Warnings are throttled.
 
 ## Test 5: tracking-loss and ownership checks
 
 While the simulator is moving slowly:
 
-1. Stop `teleop_wuji.sh`. The body must hold its last PD target after the body
-   timestamp timeout.
+1. Stop `teleop_wuji.sh`. The simulator must continue balancing against its last
+   valid high-level mimic target after the body timestamp timeout.
 2. Stop the dry-run bridge. Each hand must hold its most recent valid target
    after the hand action timestamp timeout.
 3. Restart both and confirm that control resumes without a zero/open-hand jump.
@@ -271,8 +342,11 @@ to stop `sim2real_wuji.sh` or `wuji_hand_bridge.py`.
   official URDF and MJCF.
 - missing meshes: preserve the adjacent Wuji description checkout and its
   relative directory structure.
-- missing `t_action`: start `teleop_wuji.sh`; the simulator intentionally refuses
-  untimestamped body targets.
+- missing `pico_body_timestamp` or frozen/kneeling preview: recalibrate the two
+  ankle trackers, select Full Body, turn Send on, and disable XRoboToolkit's
+  `Switch w/ A Button`; do not start body teleop until the preview moves.
+- missing `t_action`: start `teleop_wuji.sh`; the simulator keeps balancing on its
+  safe default/last valid target until a valid command arrives.
 - stale hand action: confirm `wuji_hand_bridge.sh --dry-run` is running and all
   processes use the same `REDIS_IP` and `REDIS_PORT`.
 - incorrect finger motion: compare the printed actuator order with standalone
